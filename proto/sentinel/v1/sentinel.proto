@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package sentinel.v1;
+
+message Envelope {
+  uint32 schema_version = 1;
+  uint64 sequence = 2;
+  uint64 simulation_time_ms = 3;
+  string sender_id = 4;
+  string recipient_id = 5;
+}

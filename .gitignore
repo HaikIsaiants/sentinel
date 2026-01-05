@@ -1,0 +1,6 @@
+/build/
+/build-*/
+/out/
+/vcpkg_installed/
+/.cache/
+*.tmp
