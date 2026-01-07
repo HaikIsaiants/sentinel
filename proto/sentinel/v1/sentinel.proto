@@ -2,10 +2,186 @@ syntax = "proto3";
 
 package sentinel.v1;
 
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_SEARCH = 1;
+  CAPABILITY_INSPECTION = 2;
+}
+
+enum RegionKind {
+  REGION_KIND_UNSPECIFIED = 0;
+  REGION_KIND_OBSTACLE = 1;
+  REGION_KIND_RESTRICTED = 2;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING = 1;
+  TASK_STATUS_COMPLETED = 2;
+  TASK_STATUS_MISSED = 3;
+}
+
+enum AllocationPolicy {
+  ALLOCATION_POLICY_UNSPECIFIED = 0;
+  ALLOCATION_POLICY_SCRIPTED = 1;
+}
+
+enum TaskReportKind {
+  TASK_REPORT_KIND_UNSPECIFIED = 0;
+  TASK_REPORT_KIND_WORKING = 1;
+  TASK_REPORT_KIND_REJECTED = 2;
+}
+
+enum BehaviorMode {
+  BEHAVIOR_MODE_UNSPECIFIED = 0;
+  BEHAVIOR_MODE_IDLE = 1;
+  BEHAVIOR_MODE_WAITING = 2;
+  BEHAVIOR_MODE_NAVIGATING = 3;
+  BEHAVIOR_MODE_EXECUTING = 4;
+}
+
+message Point {
+  sint64 x_mm = 1;
+  sint64 y_mm = 2;
+}
+
+message Region {
+  string id = 1;
+  RegionKind kind = 2;
+  Point minimum = 3;
+  Point maximum = 4;
+}
+
+message World {
+  sint64 width_mm = 1;
+  sint64 height_mm = 2;
+  repeated Region regions = 3;
+  sint64 grid_cell_mm = 4;
+}
+
+message VehicleSpec {
+  string id = 1;
+  string kind = 2;
+  Point initial_position = 3;
+  sint64 max_speed_mm_s = 4;
+  sint64 initial_energy_mj = 5;
+  sint64 energy_cost_mj_per_meter = 6;
+  sint64 payload_grams = 7;
+  repeated Capability capabilities = 8;
+}
+
+message TaskSpec {
+  string id = 1;
+  string kind = 2;
+  Point target = 3;
+  Capability required_capability = 4;
+  sint64 payload_required_grams = 5;
+  uint64 deadline_tick = 6;
+  sint64 completion_radius_mm = 7;
+  string assigned_agent_id = 8;
+  bool released = 9;
+  uint64 service_ticks = 10;
+}
+
+message Scenario {
+  uint32 schema_version = 1;
+  string name = 2;
+  uint64 seed = 3;
+  uint64 step_ms = 4;
+  uint64 max_ticks = 5;
+  World world = 6;
+  repeated VehicleSpec vehicles = 7;
+  repeated TaskSpec tasks = 8;
+  AllocationPolicy allocation_policy = 11;
+}
+
+message VehicleState {
+  string id = 1;
+  string kind = 2;
+  Point position = 3;
+  sint64 velocity_x_mm_s = 4;
+  sint64 velocity_y_mm_s = 5;
+  sint64 max_speed_mm_s = 6;
+  sint64 energy_mj = 7;
+  sint64 payload_grams = 8;
+  repeated Capability capabilities = 9;
+  bool active = 11;
+  sint64 initial_energy_mj = 12;
+  sint64 energy_cost_mj_per_meter = 13;
+}
+
+message TaskState {
+  string id = 1;
+  string kind = 2;
+  Point target = 3;
+  Capability required_capability = 4;
+  sint64 payload_required_grams = 5;
+  uint64 deadline_tick = 6;
+  sint64 completion_radius_mm = 7;
+  string assigned_agent_id = 8;
+  TaskStatus status = 9;
+  uint64 service_ticks = 10;
+  uint64 progress_ticks = 12;
+}
+
+message TaskReport {
+  string task_id = 1;
+  TaskReportKind kind = 2;
+}
+
+message AgentObservation {
+  uint64 tick = 1;
+  uint64 step_ms = 2;
+  VehicleState self = 3;
+  repeated TaskState assigned_tasks = 4;
+  World world = 6;
+}
+
+message AgentAction {
+  uint64 tick = 1;
+  sint64 velocity_x_mm_s = 2;
+  sint64 velocity_y_mm_s = 3;
+  repeated TaskReport task_reports = 6;
+  BehaviorMode behavior_mode = 8;
+}
+
 message Envelope {
   uint32 schema_version = 1;
   uint64 sequence = 2;
   uint64 simulation_time_ms = 3;
   string sender_id = 4;
   string recipient_id = 5;
+  oneof body {
+    AgentObservation observation = 10;
+    AgentAction action = 11;
+  }
+}
+
+message ActionBatch {
+  uint64 tick = 1;
+  repeated Envelope actions = 2;
+}
+
+message SimulationSummary {
+  bool success = 1;
+  uint64 ticks = 2;
+  string terminal_hash = 3;
+  repeated string tick_hashes = 4;
+  uint32 completed_tasks = 5;
+  uint32 total_tasks = 6;
+  uint32 active_agents = 7;
+}
+
+message ObservationBatch {
+  uint64 tick = 1;
+  repeated Envelope observations = 2;
+  bool finished = 3;
+  SimulationSummary summary = 4;
+}
+
+message SimulationFrame {
+  oneof body {
+    ObservationBatch observations = 1;
+    ActionBatch actions = 2;
+  }
 }
