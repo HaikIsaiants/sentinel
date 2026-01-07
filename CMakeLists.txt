@@ -47,18 +47,45 @@ target_link_libraries(sentinel_core PUBLIC sentinel_proto sentinel_planning)
 add_executable(sentinel_sim sim/src/main.cpp)
 target_link_libraries(sentinel_sim PRIVATE sentinel_core)
 
+add_library(sentinel_agent_logic agent/src/autonomy.cpp)
+target_include_directories(sentinel_agent_logic PUBLIC agent/include)
+target_link_libraries(sentinel_agent_logic PUBLIC sentinel_proto sentinel_planning)
+
+add_executable(sentinel_agent agent/src/main.cpp)
+target_link_libraries(sentinel_agent PRIVATE sentinel_agent_logic)
+
+if(UNIX)
+    add_executable(sentinel_supervisor runner/src/main.cpp)
+    target_link_libraries(sentinel_supervisor PRIVATE sentinel_proto)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
     include(GoogleTest)
     add_executable(sentinel_tests
+        tests/autonomy_test.cpp
         tests/framing_test.cpp
+        tests/mission_execution_test.cpp
         tests/planner_test.cpp
         tests/rng_test.cpp
         tests/scenario_test.cpp
         tests/simulator_test.cpp
     )
     target_include_directories(sentinel_tests PRIVATE tests)
-    target_link_libraries(sentinel_tests PRIVATE sentinel_core GTest::gtest_main)
+    target_link_libraries(sentinel_tests PRIVATE sentinel_core sentinel_agent_logic GTest::gtest_main)
     gtest_discover_tests(sentinel_tests)
+    add_test(
+        NAME agent_smoke
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_agent.py
+            --agent $<TARGET_FILE:sentinel_agent>
+    )
+    if(UNIX)
+        add_test(
+            NAME runner_tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_runner.py
+                --runner $<TARGET_FILE:sentinel_supervisor>
+        )
+    endif()
 endif()
