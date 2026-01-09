@@ -1,0 +1,36 @@
+schema_version: 1
+name: "stress"
+seed: 91
+step_ms: 100
+max_ticks: 200
+network_profile: "delayed"
+allocation_policy: ALLOCATION_POLICY_SCRIPTED
+world {
+  width_mm: 20000
+  height_mm: 20000
+  grid_cell_mm: 1000
+}
+network_profiles {
+  id: "delayed"
+  latency_ticks: 4
+}
+vehicles {
+  id: "agent-a"
+  kind: "ugv"
+  initial_position { x_mm: 0 y_mm: 0 }
+  max_speed_mm_s: 1000
+  initial_energy_mj: 100000
+  energy_cost_mj_per_meter: 100
+  capabilities: CAPABILITY_INSPECTION
+}
+tasks {
+  id: "task-a"
+  kind: "inspection"
+  target { x_mm: 3000 y_mm: 0 }
+  required_capability: CAPABILITY_INSPECTION
+  deadline_tick: 150
+  completion_radius_mm: 100
+  assigned_agent_id: "agent-a"
+  released: true
+  service_ticks: 3
+}

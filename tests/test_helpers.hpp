@@ -11,10 +11,13 @@ inline v1::Scenario baseline_scenario() {
     result.set_seed(41);
     result.set_step_ms(100);
     result.set_max_ticks(40);
+    result.set_network_profile("local");
     result.set_allocation_policy(v1::ALLOCATION_POLICY_SCRIPTED);
     result.mutable_world()->set_width_mm(10000);
     result.mutable_world()->set_height_mm(10000);
     result.mutable_world()->set_grid_cell_mm(1000);
+    auto* profile = result.add_network_profiles();
+    profile->set_id("local");
     auto* vehicle = result.add_vehicles();
     vehicle->set_id("agent-a");
     vehicle->set_kind("ugv");

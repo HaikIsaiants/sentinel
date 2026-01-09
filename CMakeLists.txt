@@ -37,6 +37,7 @@ target_link_libraries(sentinel_planning PUBLIC sentinel_proto Eigen3::Eigen)
 
 add_library(sentinel_core
     core/src/hash.cpp
+    core/src/network.cpp
     core/src/rng.cpp
     core/src/scenario.cpp
     core/src/simulator.cpp
@@ -68,6 +69,7 @@ if(BUILD_TESTING)
         tests/autonomy_test.cpp
         tests/framing_test.cpp
         tests/mission_execution_test.cpp
+        tests/network_test.cpp
         tests/planner_test.cpp
         tests/rng_test.cpp
         tests/scenario_test.cpp

@@ -26,6 +26,12 @@ enum AllocationPolicy {
   ALLOCATION_POLICY_SCRIPTED = 1;
 }
 
+enum NetworkDisposition {
+  NETWORK_DISPOSITION_UNSPECIFIED = 0;
+  NETWORK_DISPOSITION_QUEUED = 1;
+  NETWORK_DISPOSITION_DELIVERED = 4;
+}
+
 enum TaskReportKind {
   TASK_REPORT_KIND_UNSPECIFIED = 0;
   TASK_REPORT_KIND_WORKING = 1;
@@ -57,6 +63,11 @@ message World {
   sint64 height_mm = 2;
   repeated Region regions = 3;
   sint64 grid_cell_mm = 4;
+}
+
+message NetworkProfile {
+  string id = 1;
+  uint64 latency_ticks = 2;
 }
 
 message VehicleSpec {
@@ -92,7 +103,9 @@ message Scenario {
   World world = 6;
   repeated VehicleSpec vehicles = 7;
   repeated TaskSpec tasks = 8;
+  string network_profile = 10;
   AllocationPolicy allocation_policy = 11;
+  repeated NetworkProfile network_profiles = 12;
 }
 
 message VehicleState {
@@ -129,18 +142,42 @@ message TaskReport {
   TaskReportKind kind = 2;
 }
 
+message NetworkMessage {
+  string sender_id = 1;
+  string recipient_id = 2;
+  uint64 version = 3;
+  bytes payload = 4;
+}
+
+message NetworkOutcome {
+  uint64 sequence = 1;
+  NetworkDisposition disposition = 2;
+  uint64 tick = 3;
+  NetworkMessage message = 4;
+  uint64 serialized_bytes = 5;
+  uint64 enqueue_tick = 6;
+  uint64 transmit_start_tick = 7;
+  uint64 transmit_end_tick = 8;
+  uint64 delivery_tick = 9;
+  string profile_id = 12;
+}
+
 message AgentObservation {
   uint64 tick = 1;
   uint64 step_ms = 2;
   VehicleState self = 3;
   repeated TaskState assigned_tasks = 4;
+  repeated NetworkMessage delivered_messages = 5;
   World world = 6;
+  repeated string peer_ids = 8;
+  string network_profile = 12;
 }
 
 message AgentAction {
   uint64 tick = 1;
   sint64 velocity_x_mm_s = 2;
   sint64 velocity_y_mm_s = 3;
+  repeated NetworkMessage outgoing_messages = 4;
   repeated TaskReport task_reports = 6;
   BehaviorMode behavior_mode = 8;
 }
@@ -154,6 +191,7 @@ message Envelope {
   oneof body {
     AgentObservation observation = 10;
     AgentAction action = 11;
+    NetworkMessage message = 12;
   }
 }
 
@@ -170,6 +208,9 @@ message SimulationSummary {
   uint32 completed_tasks = 5;
   uint32 total_tasks = 6;
   uint32 active_agents = 7;
+  uint64 communication_bytes = 16;
+  uint64 communication_messages = 17;
+  uint64 delivered_messages = 18;
 }
 
 message ObservationBatch {
