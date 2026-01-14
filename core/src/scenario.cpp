@@ -33,6 +33,13 @@ void normalize_scenario(sentinel::v1::Scenario& scenario) {
               [](const auto& left, const auto& right) { return left.id() < right.id(); });
     std::sort(scenario.mutable_tasks()->begin(), scenario.mutable_tasks()->end(),
               [](const auto& left, const auto& right) { return left.id() < right.id(); });
+    std::sort(scenario.mutable_events()->begin(), scenario.mutable_events()->end(),
+              [](const auto& left, const auto& right) {
+                  if (left.tick() != right.tick()) {
+                      return left.tick() < right.tick();
+                  }
+                  return left.id() < right.id();
+              });
 }
 
 void validate_scenario(const sentinel::v1::Scenario& scenario) {
@@ -60,6 +67,29 @@ void validate_scenario(const sentinel::v1::Scenario& scenario) {
         if (task.id().empty() || !tasks.insert(task.id()).second || task.deadline_tick() == 0
             || task.service_ticks() == 0 || !vehicles.contains(task.assigned_agent_id())) {
             throw std::invalid_argument("invalid task");
+        }
+    }
+    std::set<std::string> profiles;
+    for (const auto& profile : scenario.network_profiles()) {
+        if (profile.id().empty() || !profiles.insert(profile.id()).second) {
+            throw std::invalid_argument("invalid network profile");
+        }
+    }
+    if (!profiles.contains(scenario.network_profile())) {
+        throw std::invalid_argument("active network profile is missing");
+    }
+    std::set<std::string> locations;
+    for (const auto& location : scenario.world().locations()) {
+        if (location.id().empty() || !locations.insert(location.id()).second
+            || location.radius_mm() <= 0) {
+            throw std::invalid_argument("invalid service location");
+        }
+    }
+    std::set<std::string> events;
+    for (const auto& event : scenario.events()) {
+        if (event.id().empty() || !events.insert(event.id()).second
+            || event.tick() >= scenario.max_ticks() || event.value_min() > event.value_max()) {
+            throw std::invalid_argument("invalid tape event");
         }
     }
 }

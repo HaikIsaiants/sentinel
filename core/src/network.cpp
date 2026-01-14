@@ -4,123 +4,132 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 
 namespace sentinel::core {
 
-NetworkEmulator::NetworkEmulator(std::uint64_t seed, std::uint64_t step_ms)
+NetworkEmulator::NetworkEmulator(
+    std::uint64_t seed, std::uint64_t step_ms)
     : seed_(seed), step_ms_(step_ms) {
     if (step_ms_ == 0) {
         throw std::invalid_argument("network step cannot be zero");
     }
 }
 
-void NetworkEmulator::set_profile(const sentinel::v1::NetworkProfile& profile) {
-    validate_profile(profile);
+void NetworkEmulator::set_profile(
+    const sentinel::v1::NetworkProfile& profile) {
+    if (profile.id().empty()) {
+        throw std::invalid_argument("network profile id is required");
+    }
     profile_ = profile;
 }
 
 NetworkStep NetworkEmulator::step(
-    std::uint64_t tick, const std::vector<sentinel::v1::NetworkMessage>& outgoing) {
+    std::uint64_t tick,
+    const std::vector<sentinel::v1::NetworkMessage>& outgoing) {
+    if (profile_.id().empty()) {
+        throw std::logic_error("network profile has not been selected");
+    }
+    auto prepared = prepare_batch(outgoing);
     NetworkStep result;
-    accept_outgoing(tick, outgoing, result);
-    deliver_ready(tick, result);
-    sort_deliveries(result);
+    release_due(tick, result);
+    enqueue_batch(tick, std::move(prepared), result);
+    sort_delivered(result);
     return result;
 }
 
-void NetworkEmulator::validate_profile(
-    const sentinel::v1::NetworkProfile& profile) const {
-    if (profile.id().empty()) {
-        throw std::invalid_argument("network profile id is required");
-    }
-}
-
-void NetworkEmulator::validate_message(
-    const sentinel::v1::NetworkMessage& message) const {
-    if (message.sender_id().empty()) {
-        throw std::invalid_argument("network message sender is required");
-    }
-    if (message.recipient_id().empty()) {
-        throw std::invalid_argument("network message recipient is required");
-    }
-    if (message.sender_id() == message.recipient_id()) {
-        throw std::invalid_argument("network message cannot target its sender");
-    }
-}
-
-std::uint64_t NetworkEmulator::serialized_size(
-    const sentinel::v1::NetworkMessage& message) const {
-    return static_cast<std::uint64_t>(
-        sentinel::protocol::deterministic_bytes(message).size());
-}
-
-NetworkEmulator::Packet NetworkEmulator::make_packet(
-    std::uint64_t tick,
-    const sentinel::v1::NetworkMessage& message) {
-    validate_message(message);
-    Packet packet;
-    packet.message = message;
-    packet.sequence = next_sequence_++;
-    packet.serialized_bytes = serialized_size(message);
-    packet.enqueue_tick = tick;
-    packet.delivery_tick =
-        tick + profile_.latency_ticks() + 1;
-    return packet;
-}
-
-void NetworkEmulator::accept_outgoing(
-    std::uint64_t tick,
-    const std::vector<sentinel::v1::NetworkMessage>& outgoing,
-    NetworkStep& result) {
+std::vector<NetworkEmulator::PreparedPacket>
+NetworkEmulator::prepare_batch(
+    const std::vector<sentinel::v1::NetworkMessage>& outgoing) const {
+    std::vector<PreparedPacket> prepared;
+    prepared.reserve(outgoing.size());
     for (const auto& message : outgoing) {
-        auto packet = make_packet(tick, message);
-        communication_bytes_ += packet.serialized_bytes;
-        ++communication_messages_;
-        append_queued_outcome(packet, tick, result);
-        queue_.push_back(std::move(packet));
+        if (message.sender_id().empty()) {
+            throw std::invalid_argument("network message sender is required");
+        }
+        if (message.recipient_id().empty()) {
+            throw std::invalid_argument("network message recipient is required");
+        }
+        if (message.sender_id() == message.recipient_id()) {
+            throw std::invalid_argument("network message cannot target its sender");
+        }
+        const auto duplicate = std::find_if(
+            prepared.begin(), prepared.end(),
+            [&](const PreparedPacket& current) {
+                return std::tuple(
+                           current.message.sender_id(),
+                           current.message.recipient_id(),
+                           current.message.version())
+                       == std::tuple(
+                           message.sender_id(),
+                           message.recipient_id(),
+                           message.version());
+            });
+        if (duplicate != prepared.end()) {
+            throw std::invalid_argument("duplicate network message");
+        }
+        PreparedPacket packet;
+        packet.message = message;
+        packet.serialized_bytes = static_cast<std::uint64_t>(
+            sentinel::protocol::deterministic_bytes(message).size());
+        prepared.push_back(std::move(packet));
     }
+    return prepared;
 }
 
-void NetworkEmulator::deliver_ready(
+void NetworkEmulator::release_due(
     std::uint64_t tick, NetworkStep& result) {
-    while (!queue_.empty() && ready_to_deliver(queue_.front(), tick)) {
+    while (!queue_.empty()
+           && queue_.front().delivery_tick <= tick) {
         auto packet = std::move(queue_.front());
         queue_.pop_front();
         result.delivered.push_back(packet.message);
-        append_delivered_outcome(packet, tick, result);
+        result.outcomes.push_back(outcome(
+            packet,
+            sentinel::v1::NETWORK_DISPOSITION_DELIVERED,
+            tick));
         ++delivered_messages_;
     }
 }
 
-bool NetworkEmulator::ready_to_deliver(
-    const Packet& packet, std::uint64_t tick) const {
-    return packet.delivery_tick <= tick;
+void NetworkEmulator::enqueue_batch(
+    std::uint64_t tick,
+    std::vector<PreparedPacket> prepared,
+    NetworkStep& result) {
+    for (auto& current : prepared) {
+        Packet packet;
+        packet.message = std::move(current.message);
+        packet.sequence = next_sequence_++;
+        packet.serialized_bytes = current.serialized_bytes;
+        packet.enqueue_tick = tick;
+        packet.delivery_tick =
+            tick + profile_.latency_ticks() + 1;
+        communication_bytes_ += packet.serialized_bytes;
+        ++communication_messages_;
+        result.outcomes.push_back(outcome(
+            packet,
+            sentinel::v1::NETWORK_DISPOSITION_QUEUED,
+            tick));
+        queue_.push_back(std::move(packet));
+    }
 }
 
-void NetworkEmulator::append_queued_outcome(
-    const Packet& packet, std::uint64_t tick,
-    NetworkStep& result) const {
-    result.outcomes.push_back(outcome(
-        packet, sentinel::v1::NETWORK_DISPOSITION_QUEUED, tick));
-}
-
-void NetworkEmulator::append_delivered_outcome(
-    const Packet& packet, std::uint64_t tick,
-    NetworkStep& result) const {
-    result.outcomes.push_back(outcome(
-        packet, sentinel::v1::NETWORK_DISPOSITION_DELIVERED, tick));
-}
-
-void NetworkEmulator::sort_deliveries(NetworkStep& result) const {
-    std::sort(result.delivered.begin(), result.delivered.end(), [](const auto& left, const auto& right) {
-        if (left.recipient_id() != right.recipient_id()) {
-            return left.recipient_id() < right.recipient_id();
-        }
-        if (left.sender_id() != right.sender_id()) {
-            return left.sender_id() < right.sender_id();
-        }
-        return left.version() < right.version();
-    });
+void NetworkEmulator::sort_delivered(
+    NetworkStep& result) {
+    std::sort(
+        result.delivered.begin(),
+        result.delivered.end(),
+        [](const auto& left, const auto& right) {
+            return std::tuple(
+                       left.recipient_id(),
+                       left.sender_id(),
+                       left.version())
+                   < std::tuple(
+                       right.recipient_id(),
+                       right.sender_id(),
+                       right.version());
+        });
 }
 
 std::uint64_t NetworkEmulator::communication_bytes() const {
@@ -153,7 +162,8 @@ void NetworkEmulator::append_hash(HashBuilder& hash) const {
 }
 
 sentinel::v1::NetworkOutcome NetworkEmulator::outcome(
-    const Packet& packet, sentinel::v1::NetworkDisposition disposition,
+    const Packet& packet,
+    sentinel::v1::NetworkDisposition disposition,
     std::uint64_t tick) const {
     sentinel::v1::NetworkOutcome result;
     result.set_sequence(packet.sequence);

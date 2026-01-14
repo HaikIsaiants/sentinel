@@ -1,0 +1,58 @@
+schema_version: 1
+name: "charger_reroute"
+seed: 77
+step_ms: 100
+max_ticks: 300
+network_profile: "local"
+allocation_policy: ALLOCATION_POLICY_SCRIPTED
+world {
+  width_mm: 20000
+  height_mm: 10000
+  grid_cell_mm: 1000
+  map_version: 1
+  locations {
+    id: "home"
+    kind: LOCATION_KIND_RETURN
+    position { x_mm: 0 y_mm: 0 }
+    radius_mm: 500
+  }
+  locations {
+    id: "charger"
+    kind: LOCATION_KIND_CHARGING
+    position { x_mm: 5000 y_mm: 0 }
+    radius_mm: 500
+    charge_mj_per_tick: 1000
+  }
+}
+network_profiles { id: "local" }
+vehicles {
+  id: "agent-a"
+  kind: "ugv"
+  initial_position { x_mm: 0 y_mm: 0 }
+  max_speed_mm_s: 2000
+  initial_energy_mj: 10000
+  energy_cost_mj_per_meter: 1000
+  capabilities: CAPABILITY_DELIVERY
+  return_location_id: "home"
+}
+tasks {
+  id: "delivery-a"
+  kind: "delivery"
+  target { x_mm: 9000 y_mm: 0 }
+  required_capability: CAPABILITY_DELIVERY
+  deadline_tick: 250
+  completion_radius_mm: 500
+  assigned_agent_id: "agent-a"
+  released: true
+  service_ticks: 3
+  service_energy_mj_per_tick: 200
+  priority: 80
+}
+events {
+  id: "drain"
+  tick: 20
+  kind: TAPE_EVENT_KIND_ENERGY_DELTA
+  target_id: "agent-a"
+  value_min: -3000
+  value_max: -3000
+}

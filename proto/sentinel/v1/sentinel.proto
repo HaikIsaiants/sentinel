@@ -6,12 +6,30 @@ enum Capability {
   CAPABILITY_UNSPECIFIED = 0;
   CAPABILITY_SEARCH = 1;
   CAPABILITY_INSPECTION = 2;
+  CAPABILITY_RELAY = 3;
+  CAPABILITY_DELIVERY = 4;
 }
 
 enum RegionKind {
   REGION_KIND_UNSPECIFIED = 0;
   REGION_KIND_OBSTACLE = 1;
   REGION_KIND_RESTRICTED = 2;
+  REGION_KIND_TERRAIN = 3;
+}
+
+enum TapeEventKind {
+  TAPE_EVENT_KIND_UNSPECIFIED = 0;
+  TAPE_EVENT_KIND_RELEASE_TASK = 1;
+  TAPE_EVENT_KIND_DISABLE_VEHICLE = 2;
+  TAPE_EVENT_KIND_ENERGY_DELTA = 3;
+  TAPE_EVENT_KIND_SET_NETWORK_PROFILE = 4;
+  TAPE_EVENT_KIND_SET_REGION_CLOSED = 5;
+}
+
+enum LocationKind {
+  LOCATION_KIND_UNSPECIFIED = 0;
+  LOCATION_KIND_CHARGING = 1;
+  LOCATION_KIND_RETURN = 2;
 }
 
 enum TaskStatus {
@@ -44,6 +62,15 @@ enum BehaviorMode {
   BEHAVIOR_MODE_WAITING = 2;
   BEHAVIOR_MODE_NAVIGATING = 3;
   BEHAVIOR_MODE_EXECUTING = 4;
+  BEHAVIOR_MODE_CHARGING = 5;
+  BEHAVIOR_MODE_RETURNING = 6;
+}
+
+enum ReplanReason {
+  REPLAN_REASON_UNSPECIFIED = 0;
+  REPLAN_REASON_BLOCKAGE = 1;
+  REPLAN_REASON_ENDURANCE = 3;
+  REPLAN_REASON_TASK = 4;
 }
 
 message Point {
@@ -56,6 +83,17 @@ message Region {
   RegionKind kind = 2;
   Point minimum = 3;
   Point maximum = 4;
+  string terrain = 5;
+  uint32 energy_multiplier_permille = 6;
+  bool closed = 7;
+}
+
+message ServiceLocation {
+  string id = 1;
+  LocationKind kind = 2;
+  Point position = 3;
+  sint64 radius_mm = 4;
+  sint64 charge_mj_per_tick = 5;
 }
 
 message World {
@@ -63,6 +101,8 @@ message World {
   sint64 height_mm = 2;
   repeated Region regions = 3;
   sint64 grid_cell_mm = 4;
+  uint64 map_version = 5;
+  repeated ServiceLocation locations = 6;
 }
 
 message NetworkProfile {
@@ -79,6 +119,8 @@ message VehicleSpec {
   sint64 energy_cost_mj_per_meter = 6;
   sint64 payload_grams = 7;
   repeated Capability capabilities = 8;
+  repeated string terrain_access = 9;
+  string return_location_id = 10;
 }
 
 message TaskSpec {
@@ -92,6 +134,20 @@ message TaskSpec {
   string assigned_agent_id = 8;
   bool released = 9;
   uint64 service_ticks = 10;
+  sint64 service_energy_mj_per_tick = 11;
+  uint32 priority = 12;
+}
+
+message TapeEvent {
+  string id = 1;
+  uint64 tick = 2;
+  TapeEventKind kind = 3;
+  string target_id = 4;
+  sint64 value_min = 5;
+  sint64 value_max = 6;
+  string rng_stream = 7;
+  string text_value = 8;
+  bool bool_value = 9;
 }
 
 message Scenario {
@@ -103,6 +159,7 @@ message Scenario {
   World world = 6;
   repeated VehicleSpec vehicles = 7;
   repeated TaskSpec tasks = 8;
+  repeated TapeEvent events = 9;
   string network_profile = 10;
   AllocationPolicy allocation_policy = 11;
   repeated NetworkProfile network_profiles = 12;
@@ -118,9 +175,12 @@ message VehicleState {
   sint64 energy_mj = 7;
   sint64 payload_grams = 8;
   repeated Capability capabilities = 9;
+  repeated string terrain_access = 10;
   bool active = 11;
   sint64 initial_energy_mj = 12;
   sint64 energy_cost_mj_per_meter = 13;
+  string return_location_id = 14;
+  sint64 energy_capacity_mj = 15;
 }
 
 message TaskState {
@@ -134,7 +194,9 @@ message TaskState {
   string assigned_agent_id = 8;
   TaskStatus status = 9;
   uint64 service_ticks = 10;
+  sint64 service_energy_mj_per_tick = 11;
   uint64 progress_ticks = 12;
+  uint32 priority = 15;
 }
 
 message TaskReport {
@@ -179,7 +241,9 @@ message AgentAction {
   sint64 velocity_y_mm_s = 3;
   repeated NetworkMessage outgoing_messages = 4;
   repeated TaskReport task_reports = 6;
+  string charge_location_id = 7;
   BehaviorMode behavior_mode = 8;
+  bool replanned = 10;
 }
 
 message Envelope {
@@ -208,6 +272,12 @@ message SimulationSummary {
   uint32 completed_tasks = 5;
   uint32 total_tasks = 6;
   uint32 active_agents = 7;
+  uint64 wait_ticks = 8;
+  uint64 replan_count = 9;
+  uint64 recharge_ticks = 10;
+  uint64 return_ticks = 11;
+  uint64 travel_distance_mm = 13;
+  uint64 energy_consumed_mj = 14;
   uint64 communication_bytes = 16;
   uint64 communication_messages = 17;
   uint64 delivered_messages = 18;

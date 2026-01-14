@@ -5,7 +5,6 @@
 
 #include <cstdint>
 #include <deque>
-#include <string_view>
 #include <vector>
 
 namespace sentinel::core {
@@ -19,7 +18,9 @@ class NetworkEmulator {
 public:
     NetworkEmulator(std::uint64_t seed, std::uint64_t step_ms);
     void set_profile(const sentinel::v1::NetworkProfile& profile);
-    NetworkStep step(std::uint64_t tick, const std::vector<sentinel::v1::NetworkMessage>& outgoing);
+    NetworkStep step(
+        std::uint64_t tick,
+        const std::vector<sentinel::v1::NetworkMessage>& outgoing);
     std::uint64_t communication_bytes() const;
     std::uint64_t communication_messages() const;
     std::uint64_t delivered_messages() const;
@@ -33,27 +34,23 @@ private:
         std::uint64_t enqueue_tick{};
         std::uint64_t delivery_tick{};
     };
+    struct PreparedPacket {
+        sentinel::v1::NetworkMessage message;
+        std::uint64_t serialized_bytes{};
+    };
 
-    void validate_profile(const sentinel::v1::NetworkProfile& profile) const;
-    void validate_message(const sentinel::v1::NetworkMessage& message) const;
-    Packet make_packet(
-        std::uint64_t tick, const sentinel::v1::NetworkMessage& message);
-    void accept_outgoing(
+    std::vector<PreparedPacket> prepare_batch(
+        const std::vector<sentinel::v1::NetworkMessage>& outgoing) const;
+    void release_due(std::uint64_t tick, NetworkStep& result);
+    void enqueue_batch(
         std::uint64_t tick,
-        const std::vector<sentinel::v1::NetworkMessage>& outgoing,
+        std::vector<PreparedPacket> prepared,
         NetworkStep& result);
-    void deliver_ready(std::uint64_t tick, NetworkStep& result);
-    bool ready_to_deliver(const Packet& packet, std::uint64_t tick) const;
-    void append_queued_outcome(
-        const Packet& packet, std::uint64_t tick, NetworkStep& result) const;
-    void append_delivered_outcome(
-        const Packet& packet, std::uint64_t tick, NetworkStep& result) const;
-    void sort_deliveries(NetworkStep& result) const;
-    std::uint64_t serialized_size(
-        const sentinel::v1::NetworkMessage& message) const;
     sentinel::v1::NetworkOutcome outcome(
-        const Packet& packet, sentinel::v1::NetworkDisposition disposition,
+        const Packet& packet,
+        sentinel::v1::NetworkDisposition disposition,
         std::uint64_t tick) const;
+    static void sort_delivered(NetworkStep& result);
 
     std::uint64_t seed_{};
     std::uint64_t step_ms_{};

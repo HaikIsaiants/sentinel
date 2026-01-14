@@ -3,12 +3,15 @@ name: "basic_mission"
 seed: 41
 step_ms: 100
 max_ticks: 100
+network_profile: "local"
 allocation_policy: ALLOCATION_POLICY_SCRIPTED
 world {
   width_mm: 10000
   height_mm: 10000
   grid_cell_mm: 1000
+  map_version: 1
 }
+network_profiles { id: "local" }
 vehicles {
   id: "agent-a"
   kind: "ugv"
@@ -29,4 +32,6 @@ tasks {
   assigned_agent_id: "agent-a"
   released: true
   service_ticks: 2
+  service_energy_mj_per_tick: 50
+  priority: 50
 }
