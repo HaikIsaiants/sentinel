@@ -36,6 +36,7 @@ target_include_directories(sentinel_planning PUBLIC planning/include)
 target_link_libraries(sentinel_planning PUBLIC sentinel_proto Eigen3::Eigen)
 
 add_library(sentinel_core
+    core/src/event_log.cpp
     core/src/hash.cpp
     core/src/network.cpp
     core/src/rng.cpp
@@ -67,6 +68,7 @@ if(BUILD_TESTING)
     include(GoogleTest)
     add_executable(sentinel_tests
         tests/autonomy_test.cpp
+        tests/event_log_test.cpp
         tests/framing_test.cpp
         tests/mission_execution_test.cpp
         tests/network_test.cpp
@@ -74,6 +76,7 @@ if(BUILD_TESTING)
         tests/rng_test.cpp
         tests/scenario_test.cpp
         tests/simulator_test.cpp
+        tests/trace_export_test.cpp
     )
     target_include_directories(sentinel_tests PRIVATE tests)
     target_link_libraries(sentinel_tests PRIVATE sentinel_core sentinel_agent_logic GTest::gtest_main)

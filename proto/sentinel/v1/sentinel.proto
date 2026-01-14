@@ -296,3 +296,38 @@ message SimulationFrame {
     ActionBatch actions = 2;
   }
 }
+
+message AppliedEvent {
+  TapeEvent source = 1;
+  sint64 resolved_value = 2;
+  string rng_stream = 3;
+  uint64 rng_state_after = 4;
+}
+
+message EventRecord {
+  uint64 sequence = 1;
+  uint64 tick = 2;
+  ActionBatch actions = 3;
+  repeated AppliedEvent applied_events = 4;
+  string state_hash = 5;
+  repeated NetworkOutcome network_outcomes = 6;
+}
+
+message EventLogHeader {
+  uint32 schema_version = 1;
+  string scenario_name = 2;
+  uint64 scenario_seed = 3;
+  string scenario_hash = 4;
+}
+
+message EventLogFooter {
+  SimulationSummary summary = 1;
+}
+
+message EventLogEntry {
+  oneof body {
+    EventLogHeader header = 1;
+    EventRecord record = 2;
+    EventLogFooter footer = 3;
+  }
+}
