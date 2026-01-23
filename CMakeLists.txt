@@ -49,7 +49,10 @@ target_link_libraries(sentinel_core PUBLIC sentinel_proto sentinel_planning)
 add_executable(sentinel_sim sim/src/main.cpp)
 target_link_libraries(sentinel_sim PRIVATE sentinel_core)
 
-add_library(sentinel_agent_logic agent/src/autonomy.cpp)
+add_library(sentinel_agent_logic
+    agent/src/allocation.cpp
+    agent/src/autonomy.cpp
+)
 target_include_directories(sentinel_agent_logic PUBLIC agent/include)
 target_link_libraries(sentinel_agent_logic PUBLIC sentinel_proto sentinel_planning)
 
@@ -67,6 +70,7 @@ if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     include(GoogleTest)
     add_executable(sentinel_tests
+        tests/allocation_test.cpp
         tests/autonomy_test.cpp
         tests/event_log_test.cpp
         tests/framing_test.cpp

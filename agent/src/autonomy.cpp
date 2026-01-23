@@ -1,5 +1,6 @@
 #include <sentinel/agent/autonomy.hpp>
 
+#include <sentinel/agent/allocation.hpp>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -34,7 +35,8 @@ bool inside(const v1::Point& point, const v1::ServiceLocation& location) {
 
 class Controller::Impl {
 public:
-    explicit Impl(std::string agent_id) : agent_id_(std::move(agent_id)) {
+    explicit Impl(std::string agent_id)
+        : agent_id_(std::move(agent_id)), allocator_(agent_id_) {
         if (agent_id_.empty()) {
             throw std::invalid_argument("agent id is required");
         }
@@ -57,6 +59,10 @@ public:
         output.set_recipient_id("sim");
         auto* action = output.mutable_action();
         action->set_tick(observation.tick());
+        const auto allocation = allocator_.update(observation);
+        for (const auto& commit : allocation.commits) {
+            action->add_allocation_commits()->CopyFrom(commit);
+        }
 
         const auto charger = std::find_if(
             observation.world().locations().begin(), observation.world().locations().end(),
@@ -77,6 +83,10 @@ public:
         }
 
         if (observation.assigned_tasks().empty()) {
+            if (allocation.pending) {
+                action->set_behavior_mode(v1::BEHAVIOR_MODE_WAITING);
+                return output;
+            }
             const auto home = std::find_if(
                 observation.world().locations().begin(), observation.world().locations().end(),
                 [&](const auto& location) {
@@ -128,6 +138,7 @@ private:
     }
 
     std::string agent_id_;
+    Allocator allocator_;
 };
 
 Controller::Controller(std::string agent_id) : impl_(std::make_unique<Impl>(std::move(agent_id))) {}

@@ -51,3 +51,20 @@ TEST(MissionExecution, ServiceConsumesConfiguredEnergy) {
     EXPECT_TRUE(simulator.summary().success());
     EXPECT_GE(simulator.summary().energy_consumed_mj(), 100);
 }
+
+TEST(MissionExecution, AllocatesAnUnownedTaskBeforeNavigation) {
+    auto scenario = sentinel::test::baseline_scenario();
+    scenario.set_allocation_policy(sentinel::v1::ALLOCATION_POLICY_NEAREST_CAPABLE);
+    scenario.mutable_tasks(0)->clear_assigned_agent_id();
+    sentinel::core::Simulator simulator(scenario);
+    sentinel::agent::Controller controller("agent-a");
+    while (!simulator.finished()) {
+        const auto observations = simulator.observe();
+        sentinel::v1::ActionBatch actions;
+        actions.set_tick(simulator.tick());
+        actions.add_actions()->CopyFrom(controller.act(observations.observations(0)));
+        simulator.step(actions);
+    }
+    EXPECT_TRUE(simulator.summary().success());
+    EXPECT_EQ(simulator.summary().rejected_commits(), 0);
+}

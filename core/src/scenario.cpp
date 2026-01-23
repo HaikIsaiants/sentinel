@@ -53,8 +53,10 @@ void validate_scenario(const sentinel::v1::Scenario& scenario) {
         || scenario.world().grid_cell_mm() <= 0) {
         throw std::invalid_argument("invalid world bounds");
     }
-    if (scenario.allocation_policy() != sentinel::v1::ALLOCATION_POLICY_SCRIPTED) {
-        throw std::invalid_argument("only scripted allocation is available");
+    const auto policy = scenario.allocation_policy();
+    if (policy != sentinel::v1::ALLOCATION_POLICY_SCRIPTED
+        && policy != sentinel::v1::ALLOCATION_POLICY_NEAREST_CAPABLE) {
+        throw std::invalid_argument("unsupported allocation policy");
     }
     std::set<std::string> vehicles;
     for (const auto& vehicle : scenario.vehicles()) {
@@ -64,8 +66,12 @@ void validate_scenario(const sentinel::v1::Scenario& scenario) {
     }
     std::set<std::string> tasks;
     for (const auto& task : scenario.tasks()) {
+        const auto has_known_owner = task.assigned_agent_id().empty()
+            || vehicles.contains(task.assigned_agent_id());
+        const auto has_required_owner = policy != sentinel::v1::ALLOCATION_POLICY_SCRIPTED
+            || !task.assigned_agent_id().empty();
         if (task.id().empty() || !tasks.insert(task.id()).second || task.deadline_tick() == 0
-            || task.service_ticks() == 0 || !vehicles.contains(task.assigned_agent_id())) {
+            || task.service_ticks() == 0 || !has_known_owner || !has_required_owner) {
             throw std::invalid_argument("invalid task");
         }
     }

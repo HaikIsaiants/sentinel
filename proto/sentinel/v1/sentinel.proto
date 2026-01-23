@@ -42,6 +42,7 @@ enum TaskStatus {
 enum AllocationPolicy {
   ALLOCATION_POLICY_UNSPECIFIED = 0;
   ALLOCATION_POLICY_SCRIPTED = 1;
+  ALLOCATION_POLICY_NEAREST_CAPABLE = 2;
 }
 
 enum NetworkDisposition {
@@ -196,7 +197,28 @@ message TaskState {
   uint64 service_ticks = 10;
   sint64 service_energy_mj_per_tick = 11;
   uint64 progress_ticks = 12;
+  uint64 allocation_epoch = 13;
+  uint64 allocation_version = 14;
   uint32 priority = 15;
+  sint64 allocation_score = 16;
+}
+
+message AllocationClaim {
+  uint64 epoch = 1;
+  uint64 version = 2;
+  string task_id = 3;
+  string agent_id = 4;
+  bool feasible = 5;
+  sint64 distance_mm = 6;
+}
+
+message AllocationCommit {
+  uint64 epoch = 1;
+  uint64 version = 2;
+  string task_id = 3;
+  string agent_id = 4;
+  sint64 distance_mm = 5;
+  sint64 score = 6;
 }
 
 message TaskReport {
@@ -231,7 +253,11 @@ message AgentObservation {
   repeated TaskState assigned_tasks = 4;
   repeated NetworkMessage delivered_messages = 5;
   World world = 6;
+  repeated TaskState available_tasks = 7;
   repeated string peer_ids = 8;
+  uint64 allocation_epoch = 9;
+  AllocationPolicy allocation_policy = 10;
+  repeated TaskState known_tasks = 11;
   string network_profile = 12;
 }
 
@@ -240,6 +266,7 @@ message AgentAction {
   sint64 velocity_x_mm_s = 2;
   sint64 velocity_y_mm_s = 3;
   repeated NetworkMessage outgoing_messages = 4;
+  repeated AllocationCommit allocation_commits = 5;
   repeated TaskReport task_reports = 6;
   string charge_location_id = 7;
   BehaviorMode behavior_mode = 8;
@@ -278,6 +305,7 @@ message SimulationSummary {
   uint64 return_ticks = 11;
   uint64 travel_distance_mm = 13;
   uint64 energy_consumed_mj = 14;
+  uint64 rejected_commits = 15;
   uint64 communication_bytes = 16;
   uint64 communication_messages = 17;
   uint64 delivered_messages = 18;

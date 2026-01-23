@@ -90,3 +90,27 @@ TEST(Autonomy, RequestsChargeOnlyInsideTheServiceRadius) {
     EXPECT_EQ(action.action().behavior_mode(), sentinel::v1::BEHAVIOR_MODE_CHARGING);
     EXPECT_EQ(action.action().charge_location_id(), "charger");
 }
+
+TEST(Autonomy, WaitsAfterProposingAnUnownedTask) {
+    sentinel::agent::Controller controller("agent-a");
+    auto input = observation(0, 0);
+    auto* value = input.mutable_observation();
+    value->clear_assigned_tasks();
+    value->set_allocation_epoch(1);
+    value->set_allocation_policy(sentinel::v1::ALLOCATION_POLICY_NEAREST_CAPABLE);
+    value->mutable_self()->set_active(true);
+    value->mutable_self()->set_energy_mj(100000);
+    value->mutable_self()->set_energy_capacity_mj(100000);
+    value->mutable_self()->set_energy_cost_mj_per_meter(100);
+    value->mutable_self()->add_capabilities(sentinel::v1::CAPABILITY_SEARCH);
+    auto* task = value->add_available_tasks();
+    task->set_id("task-a");
+    task->set_required_capability(sentinel::v1::CAPABILITY_SEARCH);
+    task->mutable_target()->set_x_mm(1000);
+    task->set_deadline_tick(30);
+    task->set_service_ticks(2);
+    const auto result = controller.act(input);
+    EXPECT_EQ(result.action().behavior_mode(), sentinel::v1::BEHAVIOR_MODE_WAITING);
+    ASSERT_EQ(result.action().allocation_commits_size(), 1);
+    EXPECT_EQ(result.action().allocation_commits(0).agent_id(), "agent-a");
+}
