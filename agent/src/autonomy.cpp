@@ -60,6 +60,10 @@ public:
         auto* action = output.mutable_action();
         action->set_tick(observation.tick());
         const auto allocation = allocator_.update(observation);
+        action->mutable_allocation_state()->CopyFrom(allocation.state);
+        for (const auto& message : allocation.outgoing_messages) {
+            action->add_outgoing_messages()->CopyFrom(message);
+        }
         for (const auto& commit : allocation.commits) {
             action->add_allocation_commits()->CopyFrom(commit);
         }

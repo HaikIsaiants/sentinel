@@ -9,8 +9,11 @@
 namespace sentinel::agent {
 
 struct AllocationResult {
+    v1::AllocationState state;
+    std::vector<v1::NetworkMessage> outgoing_messages;
     std::vector<v1::AllocationCommit> commits;
     bool pending{};
+    bool coordinated{};
 };
 
 class Allocator {

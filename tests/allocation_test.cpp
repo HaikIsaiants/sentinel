@@ -41,7 +41,11 @@ TEST(Allocation, ClaimsAFeasibleTaskForTheLocalAgent) {
     EXPECT_EQ(result.commits[0].task_id(), "task-a");
     EXPECT_EQ(result.commits[0].agent_id(), "agent-a");
     EXPECT_EQ(result.commits[0].distance_mm(), 2000);
+    EXPECT_EQ(result.state.sender_id(), "agent-a");
+    ASSERT_EQ(result.state.winners_size(), 1);
+    EXPECT_EQ(result.state.winners(0).bidder_id(), "agent-a");
     EXPECT_TRUE(result.pending);
+    EXPECT_TRUE(result.coordinated);
 }
 
 TEST(Allocation, SkipsTasksThatNeedAnotherCapability) {
@@ -54,18 +58,22 @@ TEST(Allocation, SkipsTasksThatNeedAnotherCapability) {
     EXPECT_FALSE(result.pending);
 }
 
-TEST(Allocation, VersionsSuccessiveClaimsMonotonically) {
+TEST(Allocation, KeepsAStableVersionForAnUnchangedView) {
     sentinel::agent::Allocator allocator("agent-a");
     const auto first = allocator.update(allocation_observation());
     const auto second = allocator.update(allocation_observation());
-    ASSERT_EQ(first.commits.size(), 1U);
-    ASSERT_EQ(second.commits.size(), 1U);
-    EXPECT_LT(first.commits[0].version(), second.commits[0].version());
+    EXPECT_EQ(first.state.version(), second.state.version());
+    EXPECT_EQ(
+        first.state.winners(0).version(),
+        second.state.winners(0).version());
 }
 
 TEST(Allocation, DoesNothingForScriptedMissions) {
     sentinel::agent::Allocator allocator("agent-a");
     auto observation = allocation_observation();
     observation.set_allocation_policy(sentinel::v1::ALLOCATION_POLICY_SCRIPTED);
-    EXPECT_TRUE(allocator.update(observation).commits.empty());
+    const auto result = allocator.update(observation);
+    EXPECT_TRUE(result.commits.empty());
+    EXPECT_TRUE(result.outgoing_messages.empty());
+    EXPECT_EQ(result.state.version(), 0U);
 }

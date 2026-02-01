@@ -221,6 +221,33 @@ message AllocationCommit {
   sint64 score = 6;
 }
 
+message AllocationBid {
+  uint64 epoch = 1;
+  uint64 version = 2;
+  string task_id = 3;
+  string bidder_id = 4;
+  sint64 score = 5;
+  sint64 distance_mm = 6;
+  sint64 energy_mj = 7;
+  uint64 completion_tick = 8;
+}
+
+message AllocationRelay {
+  AllocationBid bid = 1;
+  repeated string path_agent_ids = 2;
+}
+
+message AllocationState {
+  uint64 epoch = 1;
+  uint64 version = 2;
+  string sender_id = 3;
+  repeated AllocationBid bids = 4;
+  repeated AllocationBid winners = 5;
+  uint64 map_version = 7;
+  repeated AllocationCommit owners = 8;
+  repeated AllocationRelay winner_relays = 9;
+}
+
 message TaskReport {
   string task_id = 1;
   TaskReportKind kind = 2;
@@ -271,6 +298,7 @@ message AgentAction {
   string charge_location_id = 7;
   BehaviorMode behavior_mode = 8;
   bool replanned = 10;
+  AllocationState allocation_state = 11;
 }
 
 message Envelope {
