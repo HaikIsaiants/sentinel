@@ -203,7 +203,8 @@ void validate_scenario(const sentinel::v1::Scenario& scenario) {
 
     const auto policy = scenario.allocation_policy();
     if (policy != sentinel::v1::ALLOCATION_POLICY_SCRIPTED
-        && policy != sentinel::v1::ALLOCATION_POLICY_NEAREST_CAPABLE) {
+        && policy != sentinel::v1::ALLOCATION_POLICY_NEAREST_CAPABLE
+        && policy != sentinel::v1::ALLOCATION_POLICY_SENTINEL_CBBA) {
         throw std::invalid_argument("unsupported allocation policy");
     }
 

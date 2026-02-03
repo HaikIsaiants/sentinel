@@ -87,7 +87,7 @@ public:
         }
 
         if (observation.assigned_tasks().empty()) {
-            if (allocation.pending) {
+            if (allocation.pending || !allocation.commits.empty()) {
                 action->set_behavior_mode(v1::BEHAVIOR_MODE_WAITING);
                 return output;
             }

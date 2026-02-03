@@ -232,6 +232,7 @@ sentinel::v1::TaskState Simulator::task_state(const Task& current) const {
     result.set_allocation_version(current.allocation_version);
     result.set_priority(current.spec.priority());
     result.set_allocation_score(current.allocation_score);
+    result.set_bundle_position(current.bundle_position);
     return result;
 }
 
@@ -254,9 +255,13 @@ void Simulator::apply_commits(const sentinel::v1::ActionBatch& actions) {
             proposals.push_back(Proposal{&commit, envelope.sender_id()});
         }
     }
-    std::sort(proposals.begin(), proposals.end(), [](const auto& left, const auto& right) {
+    std::sort(proposals.begin(), proposals.end(), [this](const auto& left, const auto& right) {
         if (left.commit->task_id() != right.commit->task_id()) {
             return left.commit->task_id() < right.commit->task_id();
+        }
+        if (scenario_.allocation_policy() == sentinel::v1::ALLOCATION_POLICY_SENTINEL_CBBA
+            && left.commit->score() != right.commit->score()) {
+            return left.commit->score() > right.commit->score();
         }
         if (left.commit->distance_mm() != right.commit->distance_mm()) {
             return left.commit->distance_mm() < right.commit->distance_mm();
@@ -287,6 +292,7 @@ void Simulator::apply_commits(const sentinel::v1::ActionBatch& actions) {
         current->allocation_epoch = proposal.commit->epoch();
         current->allocation_version = proposal.commit->version();
         current->allocation_score = proposal.commit->score();
+        current->bundle_position = proposal.commit->bundle_position();
         accepted_task = current->spec.id();
     }
 }

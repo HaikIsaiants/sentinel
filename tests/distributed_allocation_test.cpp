@@ -36,6 +36,7 @@ sentinel::v1::AgentObservation observation(
     task->mutable_target()->set_x_mm(2000);
     task->set_deadline_tick(30);
     task->set_service_ticks(2);
+    task->set_status(sentinel::v1::TASK_STATUS_PENDING);
     result.add_known_tasks()->CopyFrom(*task);
     return result;
 }

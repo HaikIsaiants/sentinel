@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
+#include <memory>
+#include <tuple>
 #include <utility>
 
 namespace sentinel::planning {
@@ -129,6 +132,208 @@ std::optional<v1::AllocationClaim> nearest_capable(
         }
     }
     return winner;
+}
+
+class BundleEvaluator::Impl {
+public:
+    Impl(
+        const v1::World& world, const v1::VehicleState& vehicle,
+        std::uint64_t tick, std::uint64_t step_ms)
+        : world_(world), vehicle_(vehicle), tick_(tick), step_ms_(step_ms) {}
+
+    std::optional<BundleEvaluation> evaluate(
+        const std::vector<v1::TaskState>& ordered_tasks) {
+        if (!vehicle_.active() || step_ms_ == 0) {
+            return std::nullopt;
+        }
+        BundleEvaluation result;
+        result.completion_tick = tick_;
+        result.task_completion_ticks.reserve(ordered_tasks.size());
+        Coordinate position{
+            vehicle_.position().x_mm(), vehicle_.position().y_mm()};
+        auto payload = vehicle_.payload_grams();
+        const auto available_energy =
+            vehicle_.energy_mj() - reserve_energy(vehicle_);
+        if (available_energy < 0) {
+            return std::nullopt;
+        }
+        for (const auto& task : ordered_tasks) {
+            const auto capable =
+                std::find(
+                    vehicle_.capabilities().begin(),
+                    vehicle_.capabilities().end(),
+                    task.required_capability())
+                != vehicle_.capabilities().end();
+            if (task.status() != v1::TASK_STATUS_PENDING || !capable
+                || payload < task.payload_required_grams()
+                || result.completion_tick > task.deadline_tick()) {
+                return std::nullopt;
+            }
+            const Coordinate target{
+                task.target().x_mm(), task.target().y_mm()};
+            const auto& route = route_to(position, target);
+            if (!route) {
+                return std::nullopt;
+            }
+            const auto service_ticks =
+                task.service_ticks() > task.progress_ticks()
+                    ? task.service_ticks() - task.progress_ticks()
+                    : 0;
+            const auto service_energy =
+                static_cast<std::int64_t>(service_ticks)
+                * task.service_energy_mj_per_tick();
+            result.distance_mm += route->distance_mm;
+            result.energy_mj += route->energy_mj + service_energy;
+            result.completion_tick += route->travel_ticks + service_ticks;
+            if (service_energy < 0 || result.energy_mj > available_energy
+                || result.completion_tick > task.deadline_tick()) {
+                return std::nullopt;
+            }
+            result.task_completion_ticks.push_back(result.completion_tick);
+            if (task.required_capability() == v1::CAPABILITY_DELIVERY) {
+                payload -= task.payload_required_grams();
+            }
+            position = target;
+        }
+        return result;
+    }
+
+    std::optional<BundleInsertion> best_insertion(
+        const std::vector<v1::TaskState>& ordered_tasks,
+        const v1::TaskState& candidate, std::size_t minimum_index) {
+        if (minimum_index > ordered_tasks.size()
+            || std::any_of(
+                ordered_tasks.begin(), ordered_tasks.end(),
+                [&candidate](const auto& task) {
+                    return task.id() == candidate.id();
+                })) {
+            return std::nullopt;
+        }
+        const auto current = evaluate(ordered_tasks);
+        if (!current) {
+            return std::nullopt;
+        }
+        std::optional<BundleInsertion> best;
+        for (std::size_t index = minimum_index;
+             index <= ordered_tasks.size(); ++index) {
+            auto tasks = ordered_tasks;
+            tasks.insert(
+                tasks.begin() + static_cast<std::ptrdiff_t>(index),
+                candidate);
+            const auto evaluated = evaluate(tasks);
+            if (!evaluated) {
+                continue;
+            }
+            std::uint64_t delay_ticks = 0;
+            for (std::size_t task_index = 0;
+                 task_index < ordered_tasks.size(); ++task_index) {
+                const auto shifted =
+                    task_index < index ? task_index : task_index + 1;
+                if (evaluated->task_completion_ticks[shifted]
+                    > current->task_completion_ticks[task_index]) {
+                    delay_ticks +=
+                        evaluated->task_completion_ticks[shifted]
+                        - current->task_completion_ticks[task_index];
+                }
+            }
+            const auto distance =
+                evaluated->distance_mm - current->distance_mm;
+            const auto energy =
+                evaluated->energy_mj - current->energy_mj;
+            const auto completion =
+                evaluated->task_completion_ticks[index];
+            const auto slack =
+                candidate.deadline_tick() - completion;
+            const auto score =
+                static_cast<std::int64_t>(candidate.priority())
+                    * 1'000'000'000'000LL
+                + static_cast<std::int64_t>(slack) * 1'000'000LL
+                - static_cast<std::int64_t>(delay_ticks) * 1'000'000LL
+                - distance - energy;
+            const BundleInsertion insertion{
+                index, score, distance, energy, completion};
+            if (!best || insertion.score > best->score
+                || (insertion.score == best->score
+                    && std::tuple{
+                           insertion.distance_mm,
+                           insertion.energy_mj,
+                           insertion.completion_tick,
+                           insertion.index}
+                           < std::tuple{
+                                 best->distance_mm,
+                                 best->energy_mj,
+                                 best->completion_tick,
+                                 best->index})) {
+                best = insertion;
+            }
+        }
+        return best;
+    }
+
+private:
+    const std::optional<Route>& route_to(
+        const Coordinate& start, const Coordinate& goal) {
+        const auto key =
+            std::tuple{start.x(), start.y(), goal.x(), goal.y()};
+        const auto current = routes_.find(key);
+        if (current != routes_.end()) {
+            return current->second;
+        }
+        return routes_
+            .emplace(
+                key,
+                route_from(world_, vehicle_, start, goal, step_ms_))
+            .first->second;
+    }
+
+    const v1::World& world_;
+    const v1::VehicleState& vehicle_;
+    std::uint64_t tick_{};
+    std::uint64_t step_ms_{};
+    std::map<
+        std::tuple<
+            std::int64_t, std::int64_t,
+            std::int64_t, std::int64_t>,
+        std::optional<Route>>
+        routes_;
+};
+
+BundleEvaluator::BundleEvaluator(
+    const v1::World& world, const v1::VehicleState& vehicle,
+    std::uint64_t tick, std::uint64_t step_ms)
+    : impl_(std::make_unique<Impl>(
+          world, vehicle, tick, step_ms)) {}
+
+BundleEvaluator::~BundleEvaluator() = default;
+
+std::optional<BundleEvaluation> BundleEvaluator::evaluate(
+    const std::vector<v1::TaskState>& ordered_tasks) {
+    return impl_->evaluate(ordered_tasks);
+}
+
+std::optional<BundleInsertion> BundleEvaluator::best_insertion(
+    const std::vector<v1::TaskState>& ordered_tasks,
+    const v1::TaskState& candidate, std::size_t minimum_index) {
+    return impl_->best_insertion(
+        ordered_tasks, candidate, minimum_index);
+}
+
+std::optional<BundleEvaluation> evaluate_bundle(
+    const v1::World& world, const v1::VehicleState& vehicle,
+    const std::vector<v1::TaskState>& ordered_tasks,
+    std::uint64_t tick, std::uint64_t step_ms) {
+    return BundleEvaluator(world, vehicle, tick, step_ms)
+        .evaluate(ordered_tasks);
+}
+
+std::optional<BundleInsertion> best_insertion(
+    const v1::World& world, const v1::VehicleState& vehicle,
+    const std::vector<v1::TaskState>& ordered_tasks,
+    const v1::TaskState& candidate, std::uint64_t tick,
+    std::uint64_t step_ms, std::size_t minimum_index) {
+    return BundleEvaluator(world, vehicle, tick, step_ms)
+        .best_insertion(
+            ordered_tasks, candidate, minimum_index);
 }
 
 }

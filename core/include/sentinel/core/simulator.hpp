@@ -42,6 +42,7 @@ private:
         std::uint64_t allocation_epoch{};
         std::uint64_t allocation_version{};
         std::int64_t allocation_score{};
+        std::uint32_t bundle_position{};
     };
 
     Vehicle& vehicle(std::string_view id);
