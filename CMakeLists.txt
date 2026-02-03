@@ -12,6 +12,26 @@ option(BUILD_TESTING "Build tests" ON)
 find_package(Protobuf REQUIRED)
 find_package(Eigen3 CONFIG REQUIRED)
 
+include(FetchContent)
+
+set(SENTINEL_BUILD_TESTING ${BUILD_TESTING})
+set(BUILD_TESTING OFF)
+set(BTCPP_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BTCPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(BTCPP_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BTCPP_GROOT_INTERFACE OFF CACHE BOOL "" FORCE)
+set(BTCPP_SQLITE_LOGGING OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    behaviortree_cpp
+    URL https://github.com/BehaviorTree/BehaviorTree.CPP/archive/3ff6a32ba0497a08519c77a1436e3b81eff1bcd6.tar.gz
+    URL_HASH SHA256=84486d12ce7249a611726dd4fbf4a43a9b2f3abf0b00448b6d910a3a54d9a281
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+
+FetchContent_MakeAvailable(behaviortree_cpp)
+set(BUILD_TESTING ${SENTINEL_BUILD_TESTING})
+
 set(SENTINEL_PROTO ${CMAKE_SOURCE_DIR}/proto/sentinel/v1/sentinel.proto)
 set(SENTINEL_GENERATED ${CMAKE_BINARY_DIR}/generated)
 set(SENTINEL_PROTO_SOURCE ${SENTINEL_GENERATED}/sentinel/v1/sentinel.pb.cc)
@@ -54,7 +74,10 @@ add_library(sentinel_agent_logic
     agent/src/autonomy.cpp
 )
 target_include_directories(sentinel_agent_logic PUBLIC agent/include)
-target_link_libraries(sentinel_agent_logic PUBLIC sentinel_proto sentinel_planning)
+target_link_libraries(
+    sentinel_agent_logic
+    PUBLIC sentinel_proto sentinel_planning BT::behaviortree_cpp
+)
 
 add_executable(sentinel_agent agent/src/main.cpp)
 target_link_libraries(sentinel_agent PRIVATE sentinel_agent_logic)

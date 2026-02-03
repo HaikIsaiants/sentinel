@@ -35,10 +35,17 @@ sentinel::v1::Envelope observation(std::int64_t x, std::int64_t y) {
 
 TEST(Autonomy, NavigatesTowardTheEarliestTask) {
     sentinel::agent::Controller controller("agent-a");
-    const auto action = controller.act(observation(0, 0));
+    auto input = observation(0, 0);
+    auto* urgent = input.mutable_observation()->add_assigned_tasks();
+    urgent->set_id("urgent");
+    urgent->mutable_target()->set_x_mm(-1000);
+    urgent->set_deadline_tick(10);
+    urgent->set_completion_radius_mm(100);
+    urgent->set_service_ticks(1);
+    const auto action = controller.act(input);
     ASSERT_TRUE(action.has_action());
     EXPECT_EQ(action.action().behavior_mode(), sentinel::v1::BEHAVIOR_MODE_NAVIGATING);
-    EXPECT_EQ(action.action().velocity_x_mm_s(), 1000);
+    EXPECT_EQ(action.action().velocity_x_mm_s(), -1000);
 }
 
 TEST(Autonomy, ReportsWorkOnlyInsideTheCompletionRadius) {
@@ -91,6 +98,30 @@ TEST(Autonomy, RequestsChargeOnlyInsideTheServiceRadius) {
     EXPECT_EQ(action.action().charge_location_id(), "charger");
 }
 
+TEST(Autonomy, ReevaluatesBehaviorPriorityOnEveryTick) {
+    sentinel::agent::Controller controller("agent-a");
+    auto charging = observation(500, 0);
+    charging.mutable_observation()->mutable_self()->set_energy_capacity_mj(10000);
+    charging.mutable_observation()->mutable_self()->set_energy_mj(1000);
+    auto* charger = charging.mutable_observation()->mutable_world()->add_locations();
+    charger->set_id("charger");
+    charger->set_kind(sentinel::v1::LOCATION_KIND_CHARGING);
+    charger->mutable_position()->set_x_mm(500);
+    charger->set_radius_mm(100);
+    charger->set_charge_mj_per_tick(500);
+    EXPECT_EQ(
+        controller.act(charging).action().behavior_mode(),
+        sentinel::v1::BEHAVIOR_MODE_CHARGING);
+
+    auto mission = observation(0, 0);
+    mission.set_sequence(5);
+    mission.mutable_observation()->set_tick(4);
+    const auto resumed = controller.act(mission);
+    EXPECT_EQ(resumed.action().behavior_mode(), sentinel::v1::BEHAVIOR_MODE_NAVIGATING);
+    EXPECT_EQ(resumed.action().velocity_x_mm_s(), 1000);
+    EXPECT_TRUE(resumed.action().charge_location_id().empty());
+}
+
 TEST(Autonomy, WaitsAfterProposingAnUnownedTask) {
     sentinel::agent::Controller controller("agent-a");
     auto input = observation(0, 0);
@@ -113,4 +144,19 @@ TEST(Autonomy, WaitsAfterProposingAnUnownedTask) {
     EXPECT_EQ(result.action().behavior_mode(), sentinel::v1::BEHAVIOR_MODE_WAITING);
     ASSERT_EQ(result.action().allocation_commits_size(), 1);
     EXPECT_EQ(result.action().allocation_commits(0).agent_id(), "agent-a");
+}
+
+TEST(Autonomy, ReturnsHomeWhenNoMissionBranchIsReady) {
+    sentinel::agent::Controller controller("agent-a");
+    auto input = observation(0, 0);
+    input.mutable_observation()->clear_assigned_tasks();
+    input.mutable_observation()->mutable_self()->set_return_location_id("base");
+    auto* home = input.mutable_observation()->mutable_world()->add_locations();
+    home->set_id("base");
+    home->set_kind(sentinel::v1::LOCATION_KIND_RETURN);
+    home->mutable_position()->set_x_mm(500);
+    home->set_radius_mm(100);
+    const auto result = controller.act(input);
+    EXPECT_EQ(result.action().behavior_mode(), sentinel::v1::BEHAVIOR_MODE_RETURNING);
+    EXPECT_GT(result.action().velocity_x_mm_s(), 0);
 }

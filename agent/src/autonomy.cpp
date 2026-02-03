@@ -1,13 +1,17 @@
 #include <sentinel/agent/autonomy.hpp>
 
 #include <sentinel/agent/allocation.hpp>
+
+#include <behaviortree_cpp/bt_factory.h>
+
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sentinel::agent {
-
 namespace {
 
 std::int64_t velocity_component(std::int64_t delta, std::int64_t maximum) {
@@ -40,14 +44,60 @@ public:
         if (agent_id_.empty()) {
             throw std::invalid_argument("agent id is required");
         }
+        factory_.registerSimpleAction(
+            "Prepare", [this](BT::TreeNode&) { return prepare(); });
+        factory_.registerSimpleAction(
+            "Allocate", [this](BT::TreeNode&) { return allocate(); });
+        factory_.registerSimpleAction(
+            "NeedsCharge", [this](BT::TreeNode&) { return needs_charge(); });
+        factory_.registerSimpleAction(
+            "ChargeOrDivert", [this](BT::TreeNode&) { return charge_or_divert(); });
+        factory_.registerSimpleAction(
+            "SelectTask", [this](BT::TreeNode&) { return select_task(); });
+        factory_.registerSimpleAction(
+            "WorkAtTask", [this](BT::TreeNode&) { return work_at_task(); });
+        factory_.registerSimpleAction(
+            "NavigateToTask", [this](BT::TreeNode&) { return navigate_to_task(); });
+        factory_.registerSimpleAction(
+            "AllocationPending", [this](BT::TreeNode&) { return allocation_pending(); });
+        factory_.registerSimpleAction(
+            "HoldPosition", [this](BT::TreeNode&) { return hold_position(); });
+        factory_.registerSimpleAction(
+            "ReturnOrIdle", [this](BT::TreeNode&) { return return_or_idle(); });
+        tree_ = std::make_unique<BT::Tree>(factory_.createTreeFromText(
+            R"(<root BTCPP_format="4">
+  <BehaviorTree ID="Autonomy">
+    <Sequence>
+      <Prepare/>
+      <Allocate/>
+      <Fallback>
+        <Sequence>
+          <NeedsCharge/>
+          <ChargeOrDivert/>
+        </Sequence>
+        <Sequence>
+          <SelectTask/>
+          <Fallback>
+            <WorkAtTask/>
+            <NavigateToTask/>
+          </Fallback>
+        </Sequence>
+        <Sequence>
+          <AllocationPending/>
+          <HoldPosition/>
+        </Sequence>
+        <ReturnOrIdle/>
+      </Fallback>
+    </Sequence>
+  </BehaviorTree>
+</root>)"));
     }
 
     v1::Envelope act(const v1::Envelope& input) {
         if (!input.has_observation() || input.recipient_id() != agent_id_) {
             throw std::invalid_argument("observation addressed to another agent");
         }
-        const auto& observation = input.observation();
-        if (observation.self().id() != agent_id_) {
+        if (input.observation().self().id() != agent_id_) {
             throw std::invalid_argument("observation identity mismatch");
         }
 
@@ -57,85 +107,135 @@ public:
         output.set_simulation_time_ms(input.simulation_time_ms());
         output.set_sender_id(agent_id_);
         output.set_recipient_id("sim");
-        auto* action = output.mutable_action();
-        action->set_tick(observation.tick());
-        const auto allocation = allocator_.update(observation);
-        action->mutable_allocation_state()->CopyFrom(allocation.state);
+        output.mutable_action()->set_tick(input.observation().tick());
+
+        observation_ = &input.observation();
+        action_ = output.mutable_action();
+        const auto status = tree_->tickOnce();
+        observation_ = nullptr;
+        action_ = nullptr;
+        task_ = nullptr;
+        charger_ = nullptr;
+        if (status != BT::NodeStatus::SUCCESS) {
+            throw std::logic_error("autonomy behavior tree did not select an action");
+        }
+        return output;
+    }
+
+private:
+    BT::NodeStatus prepare() {
+        task_ = nullptr;
+        charger_ = nullptr;
+        allocation_pending_ = false;
+        action_->set_behavior_mode(v1::BEHAVIOR_MODE_IDLE);
+        return BT::NodeStatus::SUCCESS;
+    }
+
+    BT::NodeStatus allocate() {
+        const auto allocation = allocator_.update(*observation_);
+        action_->mutable_allocation_state()->CopyFrom(allocation.state);
         for (const auto& message : allocation.outgoing_messages) {
-            action->add_outgoing_messages()->CopyFrom(message);
+            action_->add_outgoing_messages()->CopyFrom(message);
         }
         for (const auto& commit : allocation.commits) {
-            action->add_allocation_commits()->CopyFrom(commit);
+            action_->add_allocation_commits()->CopyFrom(commit);
         }
+        allocation_pending_ = allocation.pending || !allocation.commits.empty();
+        return BT::NodeStatus::SUCCESS;
+    }
 
+    BT::NodeStatus needs_charge() {
         const auto charger = std::find_if(
-            observation.world().locations().begin(), observation.world().locations().end(),
+            observation_->world().locations().begin(),
+            observation_->world().locations().end(),
             [](const auto& location) {
                 return location.kind() == v1::LOCATION_KIND_CHARGING;
             });
-        const auto reserve = observation.self().energy_capacity_mj() / 4;
-        if (charger != observation.world().locations().end()
-            && observation.self().energy_mj() < reserve) {
-            if (inside(observation.self().position(), *charger)) {
-                action->set_behavior_mode(v1::BEHAVIOR_MODE_CHARGING);
-                action->set_charge_location_id(charger->id());
-            } else {
-                navigate(*action, observation.self(), charger->position());
-                action->set_replanned(true);
-            }
-            return output;
+        const auto reserve = observation_->self().energy_capacity_mj() / 4;
+        if (charger == observation_->world().locations().end()
+            || observation_->self().energy_mj() >= reserve) {
+            return BT::NodeStatus::FAILURE;
         }
+        charger_ = &*charger;
+        return BT::NodeStatus::SUCCESS;
+    }
 
-        if (observation.assigned_tasks().empty()) {
-            if (allocation.pending || !allocation.commits.empty()) {
-                action->set_behavior_mode(v1::BEHAVIOR_MODE_WAITING);
-                return output;
-            }
-            const auto home = std::find_if(
-                observation.world().locations().begin(), observation.world().locations().end(),
-                [&](const auto& location) {
-                    return location.id() == observation.self().return_location_id();
-                });
-            if (home != observation.world().locations().end()
-                && !inside(observation.self().position(), *home)) {
-                navigate(*action, observation.self(), home->position());
-                action->set_behavior_mode(v1::BEHAVIOR_MODE_RETURNING);
-                return output;
-            }
-            action->set_behavior_mode(v1::BEHAVIOR_MODE_IDLE);
-            return output;
+    BT::NodeStatus charge_or_divert() {
+        if (inside(observation_->self().position(), *charger_)) {
+            action_->set_behavior_mode(v1::BEHAVIOR_MODE_CHARGING);
+            action_->set_charge_location_id(charger_->id());
+        } else {
+            navigate(observation_->self(), charger_->position());
+            action_->set_replanned(true);
         }
+        return BT::NodeStatus::SUCCESS;
+    }
 
-        const auto task = std::min_element(
-            observation.assigned_tasks().begin(), observation.assigned_tasks().end(),
+    BT::NodeStatus select_task() {
+        if (observation_->assigned_tasks().empty()) {
+            return BT::NodeStatus::FAILURE;
+        }
+        task_ = &*std::min_element(
+            observation_->assigned_tasks().begin(),
+            observation_->assigned_tasks().end(),
             [](const auto& left, const auto& right) {
                 if (left.deadline_tick() != right.deadline_tick()) {
                     return left.deadline_tick() < right.deadline_tick();
                 }
                 return left.id() < right.id();
             });
-
-        if (close_to(observation.self().position(), *task)) {
-            action->set_behavior_mode(v1::BEHAVIOR_MODE_EXECUTING);
-            auto* report = action->add_task_reports();
-            report->set_task_id(task->id());
-            report->set_kind(v1::TASK_REPORT_KIND_WORKING);
-            return output;
-        }
-
-        navigate(*action, observation.self(), task->target());
-        return output;
+        return BT::NodeStatus::SUCCESS;
     }
 
-private:
-    static void navigate(
-        v1::AgentAction& action, const v1::VehicleState& vehicle, const v1::Point& target) {
-        action.set_behavior_mode(v1::BEHAVIOR_MODE_NAVIGATING);
-        action.set_velocity_x_mm_s(
+    BT::NodeStatus work_at_task() {
+        if (!close_to(observation_->self().position(), *task_)) {
+            return BT::NodeStatus::FAILURE;
+        }
+        action_->set_behavior_mode(v1::BEHAVIOR_MODE_EXECUTING);
+        auto* report = action_->add_task_reports();
+        report->set_task_id(task_->id());
+        report->set_kind(v1::TASK_REPORT_KIND_WORKING);
+        return BT::NodeStatus::SUCCESS;
+    }
+
+    BT::NodeStatus navigate_to_task() {
+        navigate(observation_->self(), task_->target());
+        return BT::NodeStatus::SUCCESS;
+    }
+
+    BT::NodeStatus allocation_pending() const {
+        return allocation_pending_ ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+    }
+
+    BT::NodeStatus hold_position() {
+        action_->set_behavior_mode(v1::BEHAVIOR_MODE_WAITING);
+        return BT::NodeStatus::SUCCESS;
+    }
+
+    BT::NodeStatus return_or_idle() {
+        const auto home = std::find_if(
+            observation_->world().locations().begin(),
+            observation_->world().locations().end(),
+            [this](const auto& location) {
+                return location.id() == observation_->self().return_location_id();
+            });
+        if (home != observation_->world().locations().end()
+            && !inside(observation_->self().position(), *home)) {
+            navigate(observation_->self(), home->position());
+            action_->set_behavior_mode(v1::BEHAVIOR_MODE_RETURNING);
+        } else {
+            action_->set_behavior_mode(v1::BEHAVIOR_MODE_IDLE);
+        }
+        return BT::NodeStatus::SUCCESS;
+    }
+
+    void navigate(const v1::VehicleState& vehicle, const v1::Point& target) {
+        action_->set_behavior_mode(v1::BEHAVIOR_MODE_NAVIGATING);
+        action_->set_velocity_x_mm_s(
             velocity_component(
                 target.x_mm() - vehicle.position().x_mm(), vehicle.max_speed_mm_s()));
-        if (action.velocity_x_mm_s() == 0) {
-            action.set_velocity_y_mm_s(
+        if (action_->velocity_x_mm_s() == 0) {
+            action_->set_velocity_y_mm_s(
                 velocity_component(
                     target.y_mm() - vehicle.position().y_mm(), vehicle.max_speed_mm_s()));
         }
@@ -143,9 +243,18 @@ private:
 
     std::string agent_id_;
     Allocator allocator_;
+    BT::BehaviorTreeFactory factory_;
+    std::unique_ptr<BT::Tree> tree_;
+    const v1::AgentObservation* observation_{};
+    v1::AgentAction* action_{};
+    const v1::TaskState* task_{};
+    const v1::ServiceLocation* charger_{};
+    bool allocation_pending_{};
 };
 
-Controller::Controller(std::string agent_id) : impl_(std::make_unique<Impl>(std::move(agent_id))) {}
+Controller::Controller(std::string agent_id)
+    : impl_(std::make_unique<Impl>(std::move(agent_id))) {}
+
 Controller::~Controller() = default;
 
 v1::Envelope Controller::act(const v1::Envelope& input) {
