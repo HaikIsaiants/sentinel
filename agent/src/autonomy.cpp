@@ -1,6 +1,7 @@
 #include <sentinel/agent/autonomy.hpp>
 
 #include <sentinel/agent/allocation.hpp>
+#include <sentinel/planning/planner.hpp>
 
 #include <behaviortree_cpp/bt_factory.h>
 
@@ -9,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 
 namespace sentinel::agent {
@@ -230,14 +232,68 @@ private:
     }
 
     void navigate(const v1::VehicleState& vehicle, const v1::Point& target) {
+        const auto map_version = observation_->world().map_version();
+        const auto goal_changed =
+            route_version_ == 0 || route_map_version_ != map_version
+            || route_goal_.x_mm() != target.x_mm()
+            || route_goal_.y_mm() != target.y_mm();
+        if (goal_changed) {
+            ++route_version_;
+            route_map_version_ = map_version;
+            route_goal_.CopyFrom(target);
+        }
+        const auto cell = observation_->world().grid_cell_mm();
+        const auto snap = [cell](std::int64_t value) {
+            if (cell <= 0) {
+                return value;
+            }
+            const auto lower = value / cell * cell;
+            const auto upper = lower + cell;
+            return value - lower < upper - value ? lower : upper;
+        };
+        const planning::Coordinate start{
+            vehicle.position().x_mm(), vehicle.position().y_mm()};
+        const planning::Coordinate goal{
+            std::clamp<std::int64_t>(
+                snap(target.x_mm()), 0, observation_->world().width_mm()),
+            std::clamp<std::int64_t>(
+                snap(target.y_mm()), 0, observation_->world().height_mm())};
+        const auto route = planning::route_from(
+            observation_->world(), vehicle, start, goal,
+            observation_->step_ms());
+        action_->set_route_version(route_version_);
+        action_->set_replanned(goal_changed);
+        auto* plan = action_->mutable_route_plan();
+        plan->set_version(route_version_);
+        plan->set_map_version(map_version);
+        plan->set_goal(
+            std::to_string(target.x_mm()) + ","
+            + std::to_string(target.y_mm()));
+        if (!route) {
+            action_->set_behavior_mode(v1::BEHAVIOR_MODE_WAITING);
+            return;
+        }
+        for (const auto& point : route->points) {
+            auto* waypoint = plan->add_waypoints();
+            waypoint->set_x_mm(point.x());
+            waypoint->set_y_mm(point.y());
+        }
         action_->set_behavior_mode(v1::BEHAVIOR_MODE_NAVIGATING);
+        const auto next = std::find_if(
+            route->points.begin(), route->points.end(),
+            [&start](const auto& point) { return point != start; });
+        if (next == route->points.end()) {
+            return;
+        }
         action_->set_velocity_x_mm_s(
             velocity_component(
-                target.x_mm() - vehicle.position().x_mm(), vehicle.max_speed_mm_s()));
+                next->x() - vehicle.position().x_mm(),
+                vehicle.max_speed_mm_s()));
         if (action_->velocity_x_mm_s() == 0) {
             action_->set_velocity_y_mm_s(
                 velocity_component(
-                    target.y_mm() - vehicle.position().y_mm(), vehicle.max_speed_mm_s()));
+                    next->y() - vehicle.position().y_mm(),
+                    vehicle.max_speed_mm_s()));
         }
     }
 
@@ -250,6 +306,9 @@ private:
     const v1::TaskState* task_{};
     const v1::ServiceLocation* charger_{};
     bool allocation_pending_{};
+    std::uint64_t route_version_{};
+    std::uint64_t route_map_version_{};
+    v1::Point route_goal_;
 };
 
 Controller::Controller(std::string agent_id)

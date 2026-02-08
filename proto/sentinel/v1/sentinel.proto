@@ -253,6 +253,13 @@ message AllocationState {
   repeated AllocationRelay winner_relays = 9;
 }
 
+message RoutePlan {
+  uint64 version = 1;
+  uint64 map_version = 2;
+  string goal = 3;
+  repeated Point waypoints = 4;
+}
+
 message TaskReport {
   string task_id = 1;
   TaskReportKind kind = 2;
@@ -302,8 +309,10 @@ message AgentAction {
   repeated TaskReport task_reports = 6;
   string charge_location_id = 7;
   BehaviorMode behavior_mode = 8;
+  uint64 route_version = 9;
   bool replanned = 10;
   AllocationState allocation_state = 11;
+  RoutePlan route_plan = 15;
 }
 
 message Envelope {

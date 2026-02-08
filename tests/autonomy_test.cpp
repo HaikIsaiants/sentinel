@@ -35,10 +35,10 @@ sentinel::v1::Envelope observation(std::int64_t x, std::int64_t y) {
 
 TEST(Autonomy, NavigatesTowardTheEarliestTask) {
     sentinel::agent::Controller controller("agent-a");
-    auto input = observation(0, 0);
+    auto input = observation(2000, 0);
     auto* urgent = input.mutable_observation()->add_assigned_tasks();
     urgent->set_id("urgent");
-    urgent->mutable_target()->set_x_mm(-1000);
+    urgent->mutable_target()->set_x_mm(0);
     urgent->set_deadline_tick(10);
     urgent->set_completion_radius_mm(100);
     urgent->set_service_ticks(1);
@@ -159,4 +159,37 @@ TEST(Autonomy, ReturnsHomeWhenNoMissionBranchIsReady) {
     const auto result = controller.act(input);
     EXPECT_EQ(result.action().behavior_mode(), sentinel::v1::BEHAVIOR_MODE_RETURNING);
     EXPECT_GT(result.action().velocity_x_mm_s(), 0);
+}
+
+TEST(Autonomy, RoutesAroundAnObstacleWithAStablePlanVersion) {
+    sentinel::agent::Controller controller("agent-a");
+    auto input = observation(0, 0);
+    auto* world = input.mutable_observation()->mutable_world();
+    world->set_map_version(1);
+    auto* obstacle = world->add_regions();
+    obstacle->set_id("blocked-cell");
+    obstacle->set_kind(sentinel::v1::REGION_KIND_OBSTACLE);
+    obstacle->mutable_minimum()->set_x_mm(1000);
+    obstacle->mutable_minimum()->set_y_mm(0);
+    obstacle->mutable_maximum()->set_x_mm(1000);
+    obstacle->mutable_maximum()->set_y_mm(0);
+    input.mutable_observation()
+        ->mutable_assigned_tasks(0)
+        ->mutable_target()
+        ->set_x_mm(2000);
+
+    const auto first = controller.act(input);
+    EXPECT_EQ(
+        first.action().behavior_mode(),
+        sentinel::v1::BEHAVIOR_MODE_NAVIGATING);
+    EXPECT_EQ(first.action().velocity_x_mm_s(), 0);
+    EXPECT_GT(first.action().velocity_y_mm_s(), 0);
+    EXPECT_TRUE(first.action().replanned());
+    ASSERT_GT(first.action().route_plan().waypoints_size(), 3);
+
+    const auto second = controller.act(input);
+    EXPECT_EQ(
+        second.action().route_version(),
+        first.action().route_version());
+    EXPECT_FALSE(second.action().replanned());
 }

@@ -8,7 +8,21 @@ allocation_policy: ALLOCATION_POLICY_SCRIPTED
 world {
   width_mm: 10000
   height_mm: 8000
-  grid_cell_mm: 1000
+  regions {
+    id: "ground-lane"
+    kind: REGION_KIND_TERRAIN
+    minimum { x_mm: 2500 y_mm: 3000 }
+    maximum { x_mm: 3500 y_mm: 5000 }
+    terrain: "ground"
+    energy_multiplier_permille: 1250
+  }
+  regions {
+    id: "restricted-northwest"
+    kind: REGION_KIND_RESTRICTED
+    minimum { x_mm: 500 y_mm: 6000 }
+    maximum { x_mm: 1500 y_mm: 7000 }
+    energy_multiplier_permille: 1000
+  }
 }
 network_profiles {
   id: "nominal"
@@ -22,6 +36,8 @@ vehicles {
   energy_cost_mj_per_meter: 1000
   payload_grams: 1000
   capabilities: CAPABILITY_SEARCH
+  capabilities: CAPABILITY_RELAY
+  terrain_access: "air"
 }
 vehicles {
   id: "ugv-bravo"
@@ -32,6 +48,20 @@ vehicles {
   energy_cost_mj_per_meter: 1500
   payload_grams: 5000
   capabilities: CAPABILITY_INSPECTION
+  capabilities: CAPABILITY_DELIVERY
+  terrain_access: "ground"
+}
+vehicles {
+  id: "uav-charlie"
+  kind: "uav"
+  initial_position { x_mm: 7000 y_mm: 1000 }
+  max_speed_mm_s: 2500
+  initial_energy_mj: 1200000
+  energy_cost_mj_per_meter: 1100
+  payload_grams: 2000
+  capabilities: CAPABILITY_RELAY
+  capabilities: CAPABILITY_DELIVERY
+  terrain_access: "air"
 }
 tasks {
   id: "search-sector-a"
@@ -51,5 +81,15 @@ tasks {
   deadline_tick: 80
   completion_radius_mm: 50
   assigned_agent_id: "ugv-bravo"
+  released: true
+}
+tasks {
+  id: "relay-point-c"
+  kind: "relay"
+  target { x_mm: 7000 y_mm: 5000 }
+  required_capability: CAPABILITY_RELAY
+  deadline_tick: 80
+  completion_radius_mm: 50
+  assigned_agent_id: "uav-charlie"
   released: true
 }
