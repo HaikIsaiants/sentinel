@@ -83,5 +83,41 @@ std::optional<BundleInsertion> best_insertion(const v1::World& world, const v1::
                                               const std::vector<v1::TaskState>& ordered_tasks,
                                               const v1::TaskState& candidate, std::uint64_t tick,
                                               std::uint64_t step_ms, std::size_t minimum_index = 0);
+std::optional<std::string> contested_resource(const v1::World& world, const Coordinate& from,
+                                              const Coordinate& to);
+
+struct Reservation {
+    std::string resource_id;
+    std::string agent_id;
+    std::uint64_t start_tick{};
+    std::uint64_t end_tick{};
+    std::uint64_t version{};
+    std::uint64_t route_version{};
+    std::uint64_t map_version{};
+};
+
+enum class ReservationResult {
+    committed,
+    rejected,
+    stale,
+    unchanged
+};
+
+class ReservationTable {
+public:
+    ReservationResult reserve(const Reservation& proposal);
+    void release_before(std::uint64_t tick);
+    void release_agent(std::string_view agent_id);
+    void release_route(std::string_view agent_id, std::uint64_t route_version);
+    void release_map(std::uint64_t map_version);
+    const std::vector<Reservation>& committed() const;
+    const std::vector<Reservation>& seen() const;
+    std::uint64_t conflicts() const;
+
+private:
+    std::vector<Reservation> committed_;
+    std::vector<Reservation> seen_;
+    std::uint64_t conflicts_{};
+};
 
 }

@@ -1,0 +1,53 @@
+schema_version: 1
+name: "chokepoint_nearest"
+seed: 109
+step_ms: 100
+max_ticks: 300
+network_profile: "local"
+allocation_policy: ALLOCATION_POLICY_NEAREST_CAPABLE
+world {
+  width_mm: 20000
+  height_mm: 10000
+  grid_cell_mm: 1000
+  map_version: 1
+  regions {
+    id: "single-lane"
+    kind: REGION_KIND_CHOKEPOINT
+    minimum { x_mm: 1000 y_mm: 0 }
+    maximum { x_mm: 2000 y_mm: 1000 }
+    energy_multiplier_permille: 1000
+  }
+}
+network_profiles { id: "local" latency_ticks: 1 }
+vehicles {
+  id: "agent-a"
+  kind: "ugv"
+  initial_position { x_mm: 0 y_mm: 0 }
+  max_speed_mm_s: 2000
+  initial_energy_mj: 100000
+  energy_cost_mj_per_meter: 100
+  payload_grams: 2000
+  capabilities: CAPABILITY_SEARCH
+}
+vehicles {
+  id: "agent-b"
+  kind: "ugv"
+  initial_position { x_mm: 15000 y_mm: 0 }
+  max_speed_mm_s: 2000
+  initial_energy_mj: 100000
+  energy_cost_mj_per_meter: 100
+  payload_grams: 2000
+  capabilities: CAPABILITY_SEARCH
+}
+tasks {
+  id: "task-a"
+  kind: "search"
+  target { x_mm: 3000 y_mm: 0 }
+  required_capability: CAPABILITY_SEARCH
+  deadline_tick: 250
+  completion_radius_mm: 500
+  released: true
+  service_ticks: 4
+  service_energy_mj_per_tick: 50
+  priority: 70
+}

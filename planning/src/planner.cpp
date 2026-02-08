@@ -97,6 +97,35 @@ struct OpenEntryOrder {
     }
 };
 
+bool same_reservation(const Reservation& left, const Reservation& right) {
+    return left.resource_id == right.resource_id && left.agent_id == right.agent_id
+           && left.start_tick == right.start_tick && left.end_tick == right.end_tick
+           && left.version == right.version && left.route_version == right.route_version
+           && left.map_version == right.map_version;
+}
+
+bool overlaps(const Reservation& left, const Reservation& right) {
+    return left.resource_id == right.resource_id && left.start_tick <= right.end_tick
+           && right.start_tick <= left.end_tick;
+}
+
+bool higher_priority(const Reservation& left, const Reservation& right) {
+    if (left.start_tick != right.start_tick) {
+        return left.start_tick < right.start_tick;
+    }
+    if (left.agent_id != right.agent_id) {
+        return left.agent_id < right.agent_id;
+    }
+    return left.version > right.version;
+}
+
+bool reservation_order(const Reservation& left, const Reservation& right) {
+    return std::tie(left.resource_id, left.start_tick, left.end_tick, left.agent_id, left.version,
+                    left.route_version, left.map_version)
+           < std::tie(right.resource_id, right.start_tick, right.end_tick, right.agent_id, right.version,
+                      right.route_version, right.map_version);
+}
+
 }
 
 bool segment_allowed(const v1::World& world, const v1::VehicleState& vehicle, const Coordinate& from,
@@ -497,6 +526,92 @@ std::optional<BundleInsertion> best_insertion(const v1::World& world,
                                                std::uint64_t step_ms, std::size_t minimum_index) {
     return BundleEvaluator(world, vehicle, tick, step_ms)
         .best_insertion(ordered_tasks, candidate, minimum_index);
+}
+
+std::optional<std::string> contested_resource(const v1::World& world, const Coordinate& from,
+                                              const Coordinate& to) {
+    std::optional<std::string> result;
+    for (const auto& region : world.regions()) {
+        if (region.kind() == v1::REGION_KIND_CHOKEPOINT && intersects(region, from, to)
+            && (!result || region.id() < *result)) {
+            result = region.id();
+        }
+    }
+    return result;
+}
+
+ReservationResult ReservationTable::reserve(const Reservation& proposal) {
+    if (proposal.resource_id.empty() || proposal.agent_id.empty() || proposal.version == 0
+        || proposal.route_version == 0 || proposal.map_version == 0 || proposal.start_tick > proposal.end_tick) {
+        throw std::invalid_argument("invalid reservation");
+    }
+    if (std::any_of(seen_.begin(), seen_.end(), [&proposal](const auto& current) {
+            return same_reservation(current, proposal);
+        })) {
+        return ReservationResult::unchanged;
+    }
+    if (std::any_of(seen_.begin(), seen_.end(), [&proposal](const auto& current) {
+            return current.agent_id == proposal.agent_id && current.version >= proposal.version;
+        })) {
+        return ReservationResult::stale;
+    }
+    seen_.push_back(proposal);
+    std::sort(seen_.begin(), seen_.end(), reservation_order);
+    std::vector<std::size_t> conflicts;
+    for (std::size_t idx = 0; idx < committed_.size(); ++idx) {
+        if (overlaps(committed_[idx], proposal)) {
+            conflicts.push_back(idx);
+        }
+    }
+    if (conflicts.empty()) {
+        committed_.push_back(proposal);
+        std::sort(committed_.begin(), committed_.end(), reservation_order);
+        return ReservationResult::committed;
+    }
+    if (std::any_of(conflicts.begin(), conflicts.end(), [this, &proposal](std::size_t index) {
+            // the proposal has to beat the entire overlap set.
+            return !higher_priority(proposal, committed_[index]);
+        })) {
+        ++conflicts_;
+        return ReservationResult::rejected;
+    }
+    conflicts_ += conflicts.size();
+    for (auto position = conflicts.rbegin(); position != conflicts.rend(); ++position) {
+        committed_.erase(committed_.begin() + static_cast<std::ptrdiff_t>(*position));
+    }
+    committed_.push_back(proposal);
+    std::sort(committed_.begin(), committed_.end(), reservation_order);
+    return ReservationResult::committed;
+}
+
+void ReservationTable::release_before(std::uint64_t tick) {
+    std::erase_if(committed_, [tick](const auto& current) { return current.end_tick < tick; });
+}
+
+void ReservationTable::release_agent(std::string_view agent_id) {
+    std::erase_if(committed_, [agent_id](const auto& current) { return current.agent_id == agent_id; });
+}
+
+void ReservationTable::release_route(std::string_view agent_id, std::uint64_t route_version) {
+    std::erase_if(committed_, [agent_id, route_version](const auto& current) {
+        return current.agent_id == agent_id && current.route_version == route_version;
+    });
+}
+
+void ReservationTable::release_map(std::uint64_t map_version) {
+    std::erase_if(committed_, [map_version](const auto& current) { return current.map_version != map_version; });
+}
+
+const std::vector<Reservation>& ReservationTable::committed() const {
+    return committed_;
+}
+
+const std::vector<Reservation>& ReservationTable::seen() const {
+    return seen_;
+}
+
+std::uint64_t ReservationTable::conflicts() const {
+    return conflicts_;
 }
 
 }

@@ -278,13 +278,49 @@ private:
             waypoint->set_x_mm(point.x());
             waypoint->set_y_mm(point.y());
         }
-        action_->set_behavior_mode(v1::BEHAVIOR_MODE_NAVIGATING);
         const auto next = std::find_if(
             route->points.begin(), route->points.end(),
             [&start](const auto& point) { return point != start; });
         if (next == route->points.end()) {
+            action_->set_behavior_mode(v1::BEHAVIOR_MODE_NAVIGATING);
             return;
         }
+        const auto resource =
+            planning::contested_resource(
+                observation_->world(), start, *next);
+        if (resource) {
+            const auto grant = std::find_if(
+                observation_->committed_reservations().begin(),
+                observation_->committed_reservations().end(),
+                [&](const auto& current) {
+                    return current.resource_id() == *resource
+                           && current.agent_id() == agent_id_
+                           && current.route_version() == route_version_
+                           && current.map_version() == map_version
+                           && current.start_tick() <= observation_->tick()
+                           && observation_->tick() <= current.end_tick();
+                });
+            if (grant
+                == observation_->committed_reservations().end()) {
+                auto* proposal =
+                    action_->add_reservation_proposals();
+                proposal->set_resource_id(*resource);
+                proposal->set_agent_id(agent_id_);
+                proposal->set_start_tick(observation_->tick() + 1);
+                proposal->set_end_tick(
+                    proposal->start_tick()
+                    + std::max<std::uint64_t>(
+                          1, route->travel_ticks)
+                    - 1);
+                proposal->set_version(++reservation_version_);
+                proposal->set_route_version(route_version_);
+                proposal->set_map_version(map_version);
+                action_->set_behavior_mode(
+                    v1::BEHAVIOR_MODE_WAITING);
+                return;
+            }
+        }
+        action_->set_behavior_mode(v1::BEHAVIOR_MODE_NAVIGATING);
         action_->set_velocity_x_mm_s(
             velocity_component(
                 next->x() - vehicle.position().x_mm(),
@@ -308,6 +344,7 @@ private:
     bool allocation_pending_{};
     std::uint64_t route_version_{};
     std::uint64_t route_map_version_{};
+    std::uint64_t reservation_version_{};
     v1::Point route_goal_;
 };
 

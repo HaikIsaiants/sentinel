@@ -15,6 +15,7 @@ enum RegionKind {
   REGION_KIND_OBSTACLE = 1;
   REGION_KIND_RESTRICTED = 2;
   REGION_KIND_TERRAIN = 3;
+  REGION_KIND_CHOKEPOINT = 4;
 }
 
 enum TapeEventKind {
@@ -71,6 +72,7 @@ enum BehaviorMode {
 enum ReplanReason {
   REPLAN_REASON_UNSPECIFIED = 0;
   REPLAN_REASON_BLOCKAGE = 1;
+  REPLAN_REASON_RESERVATION = 2;
   REPLAN_REASON_ENDURANCE = 3;
   REPLAN_REASON_TASK = 4;
 }
@@ -260,6 +262,16 @@ message RoutePlan {
   repeated Point waypoints = 4;
 }
 
+message SpaceTimeReservation {
+  string resource_id = 1;
+  string agent_id = 2;
+  uint64 start_tick = 3;
+  uint64 end_tick = 4;
+  uint64 version = 5;
+  uint64 route_version = 6;
+  uint64 map_version = 7;
+}
+
 message TaskReport {
   string task_id = 1;
   TaskReportKind kind = 2;
@@ -298,6 +310,7 @@ message AgentObservation {
   AllocationPolicy allocation_policy = 10;
   repeated TaskState known_tasks = 11;
   string network_profile = 12;
+  repeated SpaceTimeReservation committed_reservations = 14;
 }
 
 message AgentAction {
@@ -312,6 +325,7 @@ message AgentAction {
   uint64 route_version = 9;
   bool replanned = 10;
   AllocationState allocation_state = 11;
+  repeated SpaceTimeReservation reservation_proposals = 13;
   RoutePlan route_plan = 15;
 }
 
@@ -345,6 +359,7 @@ message SimulationSummary {
   uint64 replan_count = 9;
   uint64 recharge_ticks = 10;
   uint64 return_ticks = 11;
+  uint64 route_conflicts = 12;
   uint64 travel_distance_mm = 13;
   uint64 energy_consumed_mj = 14;
   uint64 rejected_commits = 15;

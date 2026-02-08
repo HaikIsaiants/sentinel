@@ -101,7 +101,9 @@ if(BUILD_TESTING)
         tests/mission_execution_test.cpp
         tests/network_test.cpp
         tests/planner_test.cpp
+        tests/reservation_test.cpp
         tests/rng_test.cpp
+        tests/route_coordination_test.cpp
         tests/scenario_test.cpp
         tests/simulator_test.cpp
         tests/trace_export_test.cpp

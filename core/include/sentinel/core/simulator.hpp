@@ -2,6 +2,7 @@
 
 #include <sentinel/core/network.hpp>
 #include <sentinel/core/rng.hpp>
+#include <sentinel/planning/planner.hpp>
 #include <sentinel/v1/sentinel.pb.h>
 
 #include <cstddef>
@@ -32,6 +33,7 @@ private:
         std::int64_t velocity_y_mm_s{};
         std::int64_t energy_mj{};
         std::int64_t energy_capacity_mj{};
+        std::uint64_t route_version{};
         bool active{true};
     };
     struct Task {
@@ -52,6 +54,13 @@ private:
     std::vector<sentinel::v1::NetworkMessage> apply_actions(
         const sentinel::v1::ActionBatch& actions);
     void apply_commits(const sentinel::v1::ActionBatch& actions);
+    void apply_reservations(const sentinel::v1::ActionBatch& actions);
+    bool valid_reservation(
+        const sentinel::v1::SpaceTimeReservation& proposal,
+        const sentinel::v1::Envelope& envelope) const;
+    bool has_reservation(
+        std::string_view agent_id, std::string_view resource_id,
+        std::uint64_t route_version) const;
     void apply_events();
     void advance_motion();
     void advance_tasks(const sentinel::v1::ActionBatch& actions);
@@ -62,6 +71,7 @@ private:
     std::vector<Task> tasks_;
     RngStreams rng_streams_;
     NetworkEmulator network_;
+    planning::ReservationTable reservations_;
     std::vector<sentinel::v1::NetworkMessage> delivered_messages_;
     std::uint64_t tick_{};
     std::size_t next_event_{};

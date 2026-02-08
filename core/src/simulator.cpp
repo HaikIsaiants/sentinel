@@ -23,6 +23,31 @@ std::int64_t squared_distance(
     return dx * dx + dy * dy;
 }
 
+planning::Reservation reservation(
+    const sentinel::v1::SpaceTimeReservation& value) {
+    return {
+        value.resource_id(),
+        value.agent_id(),
+        value.start_tick(),
+        value.end_tick(),
+        value.version(),
+        value.route_version(),
+        value.map_version()
+    };
+}
+
+void copy_reservation(
+    const planning::Reservation& source,
+    sentinel::v1::SpaceTimeReservation* target) {
+    target->set_resource_id(source.resource_id);
+    target->set_agent_id(source.agent_id);
+    target->set_start_tick(source.start_tick);
+    target->set_end_tick(source.end_tick);
+    target->set_version(source.version);
+    target->set_route_version(source.route_version);
+    target->set_map_version(source.map_version);
+}
+
 }
 
 Simulator::Simulator(sentinel::v1::Scenario scenario)
@@ -47,6 +72,7 @@ Simulator::Simulator(sentinel::v1::Scenario scenario)
             0,
             spec.initial_energy_mj(),
             spec.initial_energy_mj(),
+            0,
             true
         });
     }
@@ -101,6 +127,12 @@ sentinel::v1::ObservationBatch Simulator::observe() const {
                 observation->add_known_tasks()->CopyFrom(task_state(task));
             }
         }
+        for (const auto& committed : reservations_.committed()) {
+            if (committed.agent_id == current.spec.id()) {
+                copy_reservation(
+                    committed, observation->add_committed_reservations());
+            }
+        }
     }
     if (result.finished()) {
         result.mutable_summary()->CopyFrom(summary());
@@ -117,6 +149,7 @@ sentinel::v1::ObservationBatch Simulator::step(const sentinel::v1::ActionBatch& 
     }
     apply_events();
     apply_commits(actions);
+    apply_reservations(actions);
     const auto outgoing = apply_actions(actions);
     const auto network = network_.step(tick_, outgoing);
     delivered_messages_ = network.delivered;
@@ -147,6 +180,7 @@ sentinel::v1::SimulationSummary Simulator::summary() const {
     result.set_replan_count(replan_count_);
     result.set_recharge_ticks(recharge_ticks_);
     result.set_return_ticks(return_ticks_);
+    result.set_route_conflicts(reservations_.conflicts());
     result.set_travel_distance_mm(travel_distance_mm_);
     result.set_energy_consumed_mj(energy_consumed_mj_);
     result.set_rejected_commits(rejected_commits_);
@@ -297,6 +331,71 @@ void Simulator::apply_commits(const sentinel::v1::ActionBatch& actions) {
     }
 }
 
+bool Simulator::valid_reservation(
+    const sentinel::v1::SpaceTimeReservation& proposal,
+    const sentinel::v1::Envelope& envelope) const {
+    if (proposal.agent_id() != envelope.sender_id()
+        || proposal.resource_id().empty()
+        || proposal.version() == 0
+        || proposal.route_version() == 0
+        || proposal.route_version() != envelope.action().route_version()
+        || proposal.map_version() != scenario_.world().map_version()
+        || proposal.start_tick() <= tick_
+        || proposal.start_tick() > proposal.end_tick()) {
+        return false;
+    }
+    const auto region = std::find_if(
+        scenario_.world().regions().begin(),
+        scenario_.world().regions().end(),
+        [&](const auto& current) {
+            return current.id() == proposal.resource_id();
+        });
+    return region != scenario_.world().regions().end()
+           && region->kind() == sentinel::v1::REGION_KIND_CHOKEPOINT
+           && !region->closed();
+}
+
+void Simulator::apply_reservations(
+    const sentinel::v1::ActionBatch& actions) {
+    reservations_.release_before(tick_);
+    for (const auto& envelope : actions.actions()) {
+        if (!envelope.has_action()) {
+            continue;
+        }
+        auto& current = vehicle(envelope.sender_id());
+        const auto next_route = envelope.action().route_version();
+        if (next_route != current.route_version) {
+            reservations_.release_route(
+                current.spec.id(), current.route_version);
+            current.route_version = next_route;
+        }
+        for (const auto& proposal :
+             envelope.action().reservation_proposals()) {
+            if (!valid_reservation(proposal, envelope)) {
+                throw std::invalid_argument("invalid reservation proposal");
+            }
+            reservations_.reserve(reservation(proposal));
+        }
+    }
+}
+
+bool Simulator::has_reservation(
+    std::string_view agent_id, std::string_view resource_id,
+    std::uint64_t route_version) const {
+    return std::any_of(
+        reservations_.committed().begin(),
+        reservations_.committed().end(),
+        [&](const auto& current) {
+            return current.agent_id == agent_id
+                   && current.resource_id == resource_id
+                   && current.start_tick <= tick_
+                   && tick_ <= current.end_tick
+                   && current.route_version == route_version
+                   && current.map_version
+                          == scenario_.world().map_version();
+        });
+}
+
 std::vector<sentinel::v1::NetworkMessage> Simulator::apply_actions(
     const sentinel::v1::ActionBatch& actions) {
     std::vector<std::string> seen;
@@ -315,6 +414,25 @@ std::vector<sentinel::v1::NetworkMessage> Simulator::apply_actions(
             envelope.action().velocity_x_mm_s(), current.spec.max_speed_mm_s());
         current.velocity_y_mm_s = clamp_velocity(
             envelope.action().velocity_y_mm_s(), current.spec.max_speed_mm_s());
+        const planning::Coordinate from{current.x_mm, current.y_mm};
+        const planning::Coordinate to{
+            current.x_mm
+                + current.velocity_x_mm_s
+                      * static_cast<std::int64_t>(scenario_.step_ms())
+                      / 1000,
+            current.y_mm
+                + current.velocity_y_mm_s
+                      * static_cast<std::int64_t>(scenario_.step_ms())
+                      / 1000
+        };
+        const auto resource =
+            planning::contested_resource(scenario_.world(), from, to);
+        if (resource
+            && !has_reservation(
+                current.spec.id(), *resource, current.route_version)) {
+            current.velocity_x_mm_s = 0;
+            current.velocity_y_mm_s = 0;
+        }
         for (const auto& message : envelope.action().outgoing_messages()) {
             if (message.sender_id() != envelope.sender_id()) {
                 throw std::invalid_argument("network sender does not match action");
@@ -512,6 +630,7 @@ void Simulator::record_hash() {
         hash.signed_integer(current.velocity_x_mm_s);
         hash.signed_integer(current.velocity_y_mm_s);
         hash.signed_integer(current.energy_mj);
+        hash.unsigned_integer(current.route_version);
         hash.boolean(current.active);
     }
     for (const auto& task : tasks_) {
@@ -536,6 +655,27 @@ void Simulator::record_hash() {
     hash.unsigned_integer(energy_consumed_mj_);
     hash.unsigned_integer(allocation_epoch_);
     hash.unsigned_integer(rejected_commits_);
+    hash.unsigned_integer(reservations_.conflicts());
+    hash.unsigned_integer(reservations_.committed().size());
+    for (const auto& current : reservations_.committed()) {
+        hash.text(current.resource_id);
+        hash.text(current.agent_id);
+        hash.unsigned_integer(current.start_tick);
+        hash.unsigned_integer(current.end_tick);
+        hash.unsigned_integer(current.version);
+        hash.unsigned_integer(current.route_version);
+        hash.unsigned_integer(current.map_version);
+    }
+    hash.unsigned_integer(reservations_.seen().size());
+    for (const auto& current : reservations_.seen()) {
+        hash.text(current.resource_id);
+        hash.text(current.agent_id);
+        hash.unsigned_integer(current.start_tick);
+        hash.unsigned_integer(current.end_tick);
+        hash.unsigned_integer(current.version);
+        hash.unsigned_integer(current.route_version);
+        hash.unsigned_integer(current.map_version);
+    }
     state_hash_ = hash.finish();
     tick_hashes_.push_back(state_hash_);
 }
