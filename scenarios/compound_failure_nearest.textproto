@@ -1,0 +1,72 @@
+schema_version: 1
+name: "compound-failure-nearest"
+seed: 928451763
+step_ms: 100
+max_ticks: 300
+failure_detection_ticks: 5
+world {
+  width_mm: 8000
+  height_mm: 6000
+  grid_cell_mm: 100
+  map_version: 1
+}
+vehicles {
+  id: "uav-alpha"
+  kind: "uav"
+  initial_position { x_mm: 1000 y_mm: 3000 }
+  max_speed_mm_s: 2000
+  initial_energy_mj: 300000
+  energy_cost_mj_per_meter: 800
+  payload_grams: 1000
+  capabilities: CAPABILITY_SEARCH
+  terrain_access: "air"
+}
+vehicles {
+  id: "uav-bravo"
+  kind: "uav"
+  initial_position { x_mm: 7000 y_mm: 1000 }
+  max_speed_mm_s: 1800
+  initial_energy_mj: 350000
+  energy_cost_mj_per_meter: 900
+  payload_grams: 1800
+  capabilities: CAPABILITY_SEARCH
+  capabilities: CAPABILITY_RELAY
+  terrain_access: "air"
+}
+vehicles {
+  id: "ugv-charlie"
+  kind: "ugv"
+  initial_position { x_mm: 1000 y_mm: 5000 }
+  max_speed_mm_s: 1400
+  initial_energy_mj: 450000
+  energy_cost_mj_per_meter: 1200
+  payload_grams: 6000
+  capabilities: CAPABILITY_SEARCH
+  capabilities: CAPABILITY_DELIVERY
+  terrain_access: "ground"
+}
+tasks {
+  id: "search-owned"
+  kind: "search"
+  target { x_mm: 6000 y_mm: 3000 }
+  required_capability: CAPABILITY_SEARCH
+  deadline_tick: 280
+  completion_radius_mm: 100
+  assigned_agent_id: "uav-alpha"
+  released: true
+  service_ticks: 10
+  service_energy_mj_per_tick: 400
+  priority: 85
+}
+events {
+  id: "disable-alpha"
+  tick: 20
+  kind: TAPE_EVENT_KIND_DISABLE_VEHICLE
+  target_id: "uav-alpha"
+}
+network_profile: "connected"
+allocation_policy: ALLOCATION_POLICY_NEAREST_CAPABLE
+network_profiles {
+  id: "connected"
+  latency_ticks: 1
+}

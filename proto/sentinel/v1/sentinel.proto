@@ -75,6 +75,7 @@ enum ReplanReason {
   REPLAN_REASON_RESERVATION = 2;
   REPLAN_REASON_ENDURANCE = 3;
   REPLAN_REASON_TASK = 4;
+  REPLAN_REASON_OWNER = 5;
 }
 
 message Point {
@@ -167,6 +168,7 @@ message Scenario {
   string network_profile = 10;
   AllocationPolicy allocation_policy = 11;
   repeated NetworkProfile network_profiles = 12;
+  uint64 failure_detection_ticks = 13;
 }
 
 message VehicleState {
@@ -297,6 +299,44 @@ message NetworkOutcome {
   string profile_id = 12;
 }
 
+message AllocationConvergence {
+  uint64 epoch = 1;
+  uint64 start_tick = 2;
+  uint64 end_tick = 3;
+  bool complete = 4;
+}
+
+message FailureDetection {
+  string failed_agent_id = 1;
+  string detector_agent_id = 2;
+  uint64 failure_tick = 3;
+  uint64 detection_tick = 4;
+}
+
+message TaskReassignment {
+  string task_id = 1;
+  string failed_agent_id = 2;
+  string detector_agent_id = 3;
+  uint64 failure_tick = 4;
+  uint64 detection_tick = 5;
+  uint64 previous_epoch = 6;
+  uint64 previous_version = 7;
+  string new_agent_id = 8;
+  uint64 new_epoch = 9;
+  uint64 new_version = 10;
+  uint64 commit_tick = 11;
+  bool complete = 12;
+}
+
+message ReplanningSample {
+  string agent_id = 1;
+  ReplanReason reason = 2;
+  uint64 start_tick = 3;
+  uint64 end_tick = 4;
+  bool wait_plan = 5;
+  bool complete = 6;
+}
+
 message AgentObservation {
   uint64 tick = 1;
   uint64 step_ms = 2;
@@ -310,7 +350,9 @@ message AgentObservation {
   AllocationPolicy allocation_policy = 10;
   repeated TaskState known_tasks = 11;
   string network_profile = 12;
+  repeated FailureDetection failure_detections = 13;
   repeated SpaceTimeReservation committed_reservations = 14;
+  repeated string reachable_peer_ids = 15;
 }
 
 message AgentAction {
@@ -325,7 +367,9 @@ message AgentAction {
   uint64 route_version = 9;
   bool replanned = 10;
   AllocationState allocation_state = 11;
+  repeated FailureDetection failure_detections = 12;
   repeated SpaceTimeReservation reservation_proposals = 13;
+  repeated ReplanningSample replanning_samples = 14;
   RoutePlan route_plan = 15;
 }
 
@@ -366,6 +410,12 @@ message SimulationSummary {
   uint64 communication_bytes = 16;
   uint64 communication_messages = 17;
   uint64 delivered_messages = 18;
+  repeated AllocationConvergence allocation_convergence = 21;
+  repeated FailureDetection failure_detections = 22;
+  repeated TaskReassignment task_reassignments = 23;
+  repeated ReplanningSample replanning_samples = 24;
+  uint64 maximum_reassignment_delay_ms = 25;
+  uint32 missing_reassignments = 26;
 }
 
 message ObservationBatch {

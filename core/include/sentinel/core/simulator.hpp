@@ -46,6 +46,12 @@ private:
         std::int64_t allocation_score{};
         std::uint32_t bundle_position{};
     };
+    struct FailureMonitor {
+        std::string failed_id;
+        std::string detector_id;
+        std::uint64_t failure_tick{};
+        std::uint64_t detection_tick{};
+    };
 
     Vehicle& vehicle(std::string_view id);
     const Vehicle& vehicle(std::string_view id) const;
@@ -54,6 +60,8 @@ private:
     std::vector<sentinel::v1::NetworkMessage> apply_actions(
         const sentinel::v1::ActionBatch& actions);
     void apply_commits(const sentinel::v1::ActionBatch& actions);
+    void apply_failure_detections(
+        const sentinel::v1::ActionBatch& actions);
     void apply_reservations(const sentinel::v1::ActionBatch& actions);
     bool valid_reservation(
         const sentinel::v1::SpaceTimeReservation& proposal,
@@ -85,6 +93,14 @@ private:
     std::uint64_t energy_consumed_mj_{};
     std::uint64_t allocation_epoch_{1};
     std::uint64_t rejected_commits_{};
+    std::vector<FailureMonitor> failure_monitors_;
+    std::vector<std::string> handled_failures_;
+    std::vector<sentinel::v1::FailureDetection>
+        failure_detections_;
+    std::vector<sentinel::v1::TaskReassignment>
+        task_reassignments_;
+    std::vector<sentinel::v1::ReplanningSample>
+        replanning_samples_;
 };
 
 }

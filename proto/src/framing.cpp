@@ -15,28 +15,6 @@
 
 namespace sentinel::protocol {
 
-namespace {
-
-constexpr std::uint32_t maximum_frame_size = 16U * 1024U * 1024U;
-
-std::array<unsigned char, 4> encode_size(std::uint32_t size) {
-    return {
-        static_cast<unsigned char>((size >> 24U) & 0xffU),
-        static_cast<unsigned char>((size >> 16U) & 0xffU),
-        static_cast<unsigned char>((size >> 8U) & 0xffU),
-        static_cast<unsigned char>(size & 0xffU)
-    };
-}
-
-std::uint32_t decode_size(const std::array<unsigned char, 4>& bytes) {
-    return (static_cast<std::uint32_t>(bytes[0]) << 24U)
-           | (static_cast<std::uint32_t>(bytes[1]) << 16U)
-           | (static_cast<std::uint32_t>(bytes[2]) << 8U)
-           | static_cast<std::uint32_t>(bytes[3]);
-}
-
-}
-
 void configure_binary_stdio() {
 #ifdef _WIN32
     if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
@@ -59,15 +37,19 @@ std::string deterministic_bytes(const google::protobuf::MessageLite& message) {
 
 bool read_frame(std::istream& stream, google::protobuf::MessageLite& message) {
     std::array<unsigned char, 4> header{};
-    stream.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    stream.read(reinterpret_cast<char*>(header.data()), header.size());
     if (stream.gcount() == 0 && stream.eof()) {
         return false;
     }
     if (stream.gcount() != static_cast<std::streamsize>(header.size())) {
         throw std::runtime_error("truncated frame header");
     }
-    const auto size = decode_size(header);
-    if (size > maximum_frame_size) {
+    // 32-bit big-endian size prefix.
+    const std::uint32_t size = (static_cast<std::uint32_t>(header[0]) << 24U)
+                               | (static_cast<std::uint32_t>(header[1]) << 16U)
+                               | (static_cast<std::uint32_t>(header[2]) << 8U)
+                               | static_cast<std::uint32_t>(header[3]);
+    if (size > 16U * 1024U * 1024U) {
         throw std::runtime_error("protobuf frame is too large");
     }
     std::string payload(size, '\0');
@@ -82,12 +64,18 @@ bool read_frame(std::istream& stream, google::protobuf::MessageLite& message) {
 }
 
 void write_frame(std::ostream& stream, const google::protobuf::MessageLite& message, bool flush) {
-    const auto payload = deterministic_bytes(message);
-    if (payload.size() > maximum_frame_size) {
+    const std::string payload = deterministic_bytes(message);
+    if (payload.size() > 16U * 1024U * 1024U) {
         throw std::runtime_error("protobuf frame is too large");
     }
-    const auto header = encode_size(static_cast<std::uint32_t>(payload.size()));
-    stream.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    const auto size = static_cast<std::uint32_t>(payload.size());
+    const std::array<unsigned char, 4> header{
+        static_cast<unsigned char>((size >> 24U) & 0xffU),
+        static_cast<unsigned char>((size >> 16U) & 0xffU),
+        static_cast<unsigned char>((size >> 8U) & 0xffU),
+        static_cast<unsigned char>(size & 0xffU)
+    };
+    stream.write(reinterpret_cast<const char*>(header.data()), header.size());
     stream.write(payload.data(), static_cast<std::streamsize>(payload.size()));
     if (flush) {
         stream.flush();

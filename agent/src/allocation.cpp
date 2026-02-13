@@ -262,22 +262,18 @@ public:
     }
 
     AllocationResult update(const v1::AgentObservation& observation) {
-        if (observation.self().id() != agent_id_) {
-            throw std::invalid_argument("allocator observation identity mismatch");
-        }
-        if (observation.allocation_policy()
-                == v1::ALLOCATION_POLICY_SCRIPTED
-            || observation.allocation_policy()
-                == v1::ALLOCATION_POLICY_UNSPECIFIED) {
-            return {};
-        }
         validate_observation(observation);
         synchronize(observation);
         auto tasks = task_map(observation);
         const auto members = peer_ids(observation.peer_ids());
-        const auto peers = members;
+        const auto peers = observation.reachable_peer_ids_size() == 0
+                               ? members
+                               : peer_ids(observation.reachable_peer_ids());
         auto bidders = members;
         bidders.push_back(agent_id_);
+        for (const auto& detection : observation.failure_detections()) {
+            std::erase(bidders, detection.failed_agent_id());
+        }
         std::sort(bidders.begin(), bidders.end());
         bidders.erase(std::unique(bidders.begin(), bidders.end()), bidders.end());
         accept_messages(observation, tasks, peers, bidders, members);
@@ -331,12 +327,7 @@ public:
         }
         for (const auto& [id, task] : active) {
             const auto winner = winners.find(id);
-            if (winner == winners.end()) {
-                result.pending = result.pending || !peers.empty();
-                continue;
-            }
-            const auto agreed =
-                peers_agree(id, winner->second, peers);
+            const auto agreed = winner != winners.end() && peers_agree(id, winner->second, peers);
             result.pending = result.pending || !agreed;
             if (!agreed || winner->second.bidder_id() != agent_id_) {
                 continue;
@@ -363,8 +354,7 @@ public:
 
 private:
     void validate_observation(const v1::AgentObservation& observation) const {
-        if (observation.self().id() != agent_id_
-            || observation.allocation_epoch() == 0
+        if (observation.self().id() != agent_id_ || observation.allocation_epoch() == 0
             || observation.step_ms() == 0
             || !valid_policy(observation.allocation_policy())) {
             throw std::invalid_argument("invalid allocator observation");
@@ -400,20 +390,6 @@ private:
         for (const auto& task : observation.known_tasks()) {
             if (task.status() == v1::TASK_STATUS_PENDING) {
                 tasks.emplace(task.id(), task);
-            }
-        }
-        if (tasks.empty() && observation.known_tasks().empty()) {
-            for (const auto& task : observation.available_tasks()) {
-                if (task.status() == v1::TASK_STATUS_COMPLETED
-                    || task.status() == v1::TASK_STATUS_MISSED) {
-                    continue;
-                }
-                auto compatible = task;
-                if (compatible.status()
-                    == v1::TASK_STATUS_UNSPECIFIED) {
-                    compatible.set_status(v1::TASK_STATUS_PENDING);
-                }
-                tasks.emplace(compatible.id(), std::move(compatible));
             }
         }
         return tasks;
@@ -640,6 +616,12 @@ private:
             candidates.push_back({std::move(owner), task.assigned_agent_id() == agent_id_});
             if (task.assigned_agent_id() != agent_id_) {
                 unavailable.emplace(id, agent_id_);
+            }
+        }
+        for (const auto& detection : observation.failure_detections()) {
+            for (const auto& [id, task] : tasks) {
+                static_cast<void>(task);
+                unavailable.emplace(id, detection.failed_agent_id());
             }
         }
         for (const auto& [peer, state] : peer_states_) {

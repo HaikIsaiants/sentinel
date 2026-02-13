@@ -97,6 +97,7 @@ if(BUILD_TESTING)
         tests/autonomy_test.cpp
         tests/distributed_allocation_test.cpp
         tests/event_log_test.cpp
+        tests/failure_recovery_test.cpp
         tests/framing_test.cpp
         tests/mission_execution_test.cpp
         tests/network_test.cpp

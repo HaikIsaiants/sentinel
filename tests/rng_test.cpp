@@ -2,27 +2,25 @@
 
 #include <gtest/gtest.h>
 
-TEST(Rng, RepeatsAStreamExactly) {
-    sentinel::core::DeterministicRng first(73);
-    sentinel::core::DeterministicRng second(73);
-    for (int index = 0; index < 32; ++index) {
-        EXPECT_EQ(first.next(), second.next());
-    }
+TEST(RngStreams, RepeatsAndIgnoresAccessOrder) {
+    sentinel::core::RngStreams first(42);
+    sentinel::core::RngStreams second(42);
+    const auto first_network = first.stream("network").next();
+    const auto first_environment = first.stream("environment").next();
+    const auto second_environment = second.stream("environment").next();
+    const auto second_network = second.stream("network").next();
+    EXPECT_EQ(first_network, second_network);
+    EXPECT_EQ(first_environment, second_environment);
+    EXPECT_NE(first_network, first_environment);
+    EXPECT_EQ(first.states(), second.states());
 }
 
-TEST(Rng, NamesCreateIndependentStreams) {
-    sentinel::core::RngStreams streams(91);
-    const auto first = streams.stream("events").next();
-    const auto second = streams.stream("network").next();
-    EXPECT_NE(first, second);
-    EXPECT_EQ(streams.states().size(), 2U);
-}
-
-TEST(Rng, UniformIncludesBothEndpoints) {
-    sentinel::core::DeterministicRng rng(11);
-    for (int index = 0; index < 100; ++index) {
-        const auto value = rng.uniform(-4, 7);
-        EXPECT_GE(value, -4);
-        EXPECT_LE(value, 7);
+TEST(RngStreams, ProducesBoundedValues) {
+    sentinel::core::DeterministicRng rng(9);
+    for (int i = 0; i < 1000; ++i) {
+        const auto value = rng.uniform(-7, 13);
+        EXPECT_GE(value, -7);
+        EXPECT_LE(value, 13);
     }
+    EXPECT_THROW(rng.uniform(2, 1), std::invalid_argument);
 }

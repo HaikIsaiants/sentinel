@@ -7,7 +7,7 @@ def main():
     parser.add_argument("--agent", required=True)
     options = parser.parse_args()
     result = subprocess.run(
-        [options.agent, "--agent-id", "agent-a"],
+        [options.agent, "--id", "agent-a"],
         input=b"",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

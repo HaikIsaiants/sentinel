@@ -105,8 +105,18 @@ sentinel::v1::ObservationBatch Simulator::observe() const {
         observation->mutable_self()->CopyFrom(vehicle_state(current));
         observation->mutable_world()->CopyFrom(scenario_.world());
         for (const auto& peer : vehicles_) {
-            if (peer.spec.id() != current.spec.id()) {
-                observation->add_peer_ids(peer.spec.id());
+            observation->add_peer_ids(peer.spec.id());
+            const auto detected = std::any_of(
+                failure_monitors_.begin(), failure_monitors_.end(),
+                [&](const auto& monitor) {
+                    return monitor.detector_id == current.spec.id()
+                           && monitor.failed_id == peer.spec.id()
+                           && monitor.detection_tick <= tick_;
+                });
+            if (peer.spec.id() == current.spec.id()
+                || (peer.active && !detected)) {
+                observation->add_reachable_peer_ids(
+                    peer.spec.id());
             }
         }
         for (const auto& message : delivered_messages_) {
@@ -133,6 +143,20 @@ sentinel::v1::ObservationBatch Simulator::observe() const {
                     committed, observation->add_committed_reservations());
             }
         }
+        for (const auto& monitor : failure_monitors_) {
+            if (monitor.detector_id != current.spec.id()
+                || monitor.detection_tick > tick_) {
+                continue;
+            }
+            auto* detection =
+                observation->add_failure_detections();
+            detection->set_failed_agent_id(monitor.failed_id);
+            detection->set_detector_agent_id(
+                monitor.detector_id);
+            detection->set_failure_tick(monitor.failure_tick);
+            detection->set_detection_tick(
+                monitor.detection_tick);
+        }
     }
     if (result.finished()) {
         result.mutable_summary()->CopyFrom(summary());
@@ -148,6 +172,7 @@ sentinel::v1::ObservationBatch Simulator::step(const sentinel::v1::ActionBatch& 
         throw std::invalid_argument("action batch tick mismatch");
     }
     apply_events();
+    apply_failure_detections(actions);
     apply_commits(actions);
     apply_reservations(actions);
     const auto outgoing = apply_actions(actions);
@@ -187,6 +212,29 @@ sentinel::v1::SimulationSummary Simulator::summary() const {
     result.set_communication_bytes(network_.communication_bytes());
     result.set_communication_messages(network_.communication_messages());
     result.set_delivered_messages(network_.delivered_messages());
+    for (const auto& detection : failure_detections_) {
+        result.add_failure_detections()->CopyFrom(detection);
+    }
+    std::uint64_t maximum_delay{};
+    std::uint32_t missing{};
+    for (const auto& reassignment : task_reassignments_) {
+        result.add_task_reassignments()->CopyFrom(
+            reassignment);
+        if (!reassignment.complete()) {
+            ++missing;
+            continue;
+        }
+        maximum_delay = std::max(
+            maximum_delay,
+            (reassignment.commit_tick()
+             - reassignment.detection_tick())
+                * scenario_.step_ms());
+    }
+    result.set_maximum_reassignment_delay_ms(maximum_delay);
+    result.set_missing_reassignments(missing);
+    for (const auto& sample : replanning_samples_) {
+        result.add_replanning_samples()->CopyFrom(sample);
+    }
     return result;
 }
 
@@ -327,7 +375,95 @@ void Simulator::apply_commits(const sentinel::v1::ActionBatch& actions) {
         current->allocation_version = proposal.commit->version();
         current->allocation_score = proposal.commit->score();
         current->bundle_position = proposal.commit->bundle_position();
+        for (auto& reassignment : task_reassignments_) {
+            if (reassignment.task_id() != current->spec.id()
+                || reassignment.complete()) {
+                continue;
+            }
+            reassignment.set_new_agent_id(proposal.sender);
+            reassignment.set_new_epoch(
+                proposal.commit->epoch());
+            reassignment.set_new_version(
+                proposal.commit->version());
+            reassignment.set_commit_tick(tick_);
+            reassignment.set_complete(true);
+        }
         accepted_task = current->spec.id();
+    }
+}
+
+void Simulator::apply_failure_detections(
+    const sentinel::v1::ActionBatch& actions) {
+    for (const auto& envelope : actions.actions()) {
+        if (!envelope.has_action()) {
+            continue;
+        }
+        for (const auto& detection :
+             envelope.action().failure_detections()) {
+            const auto monitor = std::find_if(
+                failure_monitors_.begin(),
+                failure_monitors_.end(),
+                [&](const auto& current) {
+                    return current.failed_id
+                               == detection.failed_agent_id()
+                           && current.detector_id
+                                  == envelope.sender_id()
+                           && current.failure_tick
+                                  == detection.failure_tick()
+                           && current.detection_tick
+                                  == detection.detection_tick()
+                           && current.detection_tick <= tick_;
+                });
+            if (monitor == failure_monitors_.end()) {
+                throw std::invalid_argument(
+                    "unknown failure detection");
+            }
+            if (std::find(
+                    handled_failures_.begin(),
+                    handled_failures_.end(),
+                    monitor->failed_id)
+                != handled_failures_.end()) {
+                continue;
+            }
+            handled_failures_.push_back(monitor->failed_id);
+            failure_detections_.push_back(detection);
+            reservations_.release_agent(monitor->failed_id);
+            bool orphaned{};
+            for (auto& task : tasks_) {
+                if (!task.released
+                    || task.status
+                           != sentinel::v1::TASK_STATUS_PENDING
+                    || task.spec.assigned_agent_id()
+                           != monitor->failed_id) {
+                    continue;
+                }
+                auto& reassignment =
+                    task_reassignments_.emplace_back();
+                reassignment.set_task_id(task.spec.id());
+                reassignment.set_failed_agent_id(
+                    monitor->failed_id);
+                reassignment.set_detector_agent_id(
+                    monitor->detector_id);
+                reassignment.set_failure_tick(
+                    monitor->failure_tick);
+                reassignment.set_detection_tick(
+                    monitor->detection_tick);
+                reassignment.set_previous_epoch(
+                    task.allocation_epoch);
+                reassignment.set_previous_version(
+                    task.allocation_version);
+                task.spec.clear_assigned_agent_id();
+                task.allocation_epoch = 0;
+                task.allocation_version = 0;
+                task.allocation_score = 0;
+                task.bundle_position = 0;
+                task.progress_ticks = 0;
+                orphaned = true;
+            }
+            if (orphaned) {
+                ++allocation_epoch_;
+            }
+        }
     }
 }
 
@@ -408,7 +544,9 @@ std::vector<sentinel::v1::NetworkMessage> Simulator::apply_actions(
         seen.push_back(envelope.sender_id());
         auto& current = vehicle(envelope.sender_id());
         if (!current.active) {
-            throw std::invalid_argument("inactive vehicle produced an action");
+            current.velocity_x_mm_s = 0;
+            current.velocity_y_mm_s = 0;
+            continue;
         }
         current.velocity_x_mm_s = clamp_velocity(
             envelope.action().velocity_x_mm_s(), current.spec.max_speed_mm_s());
@@ -441,6 +579,10 @@ std::vector<sentinel::v1::NetworkMessage> Simulator::apply_actions(
         }
         if (envelope.action().replanned()) {
             ++replan_count_;
+        }
+        for (const auto& sample :
+             envelope.action().replanning_samples()) {
+            replanning_samples_.push_back(sample);
         }
         if (envelope.action().behavior_mode() == sentinel::v1::BEHAVIOR_MODE_WAITING) {
             ++wait_ticks_;
@@ -518,6 +660,10 @@ void Simulator::advance_tasks(const sentinel::v1::ActionBatch& actions) {
             task.status = sentinel::v1::TASK_STATUS_MISSED;
             continue;
         }
+        if (task.spec.assigned_agent_id().empty()) {
+            task.progress_ticks = 0;
+            continue;
+        }
         const auto action = std::find_if(
             actions.actions().begin(), actions.actions().end(),
             [&](const auto& envelope) {
@@ -582,6 +728,19 @@ void Simulator::apply_events() {
             current.active = false;
             current.velocity_x_mm_s = 0;
             current.velocity_y_mm_s = 0;
+            reservations_.release_agent(current.spec.id());
+            for (const auto& detector : vehicles_) {
+                if (!detector.active
+                    || detector.spec.id() == current.spec.id()) {
+                    continue;
+                }
+                failure_monitors_.push_back(FailureMonitor{
+                    current.spec.id(),
+                    detector.spec.id(),
+                    tick_,
+                    tick_ + scenario_.failure_detection_ticks()
+                });
+            }
             break;
         }
         case sentinel::v1::TAPE_EVENT_KIND_ENERGY_DELTA: {
@@ -675,6 +834,25 @@ void Simulator::record_hash() {
         hash.unsigned_integer(current.version);
         hash.unsigned_integer(current.route_version);
         hash.unsigned_integer(current.map_version);
+    }
+    hash.unsigned_integer(failure_monitors_.size());
+    for (const auto& monitor : failure_monitors_) {
+        hash.text(monitor.failed_id);
+        hash.text(monitor.detector_id);
+        hash.unsigned_integer(monitor.failure_tick);
+        hash.unsigned_integer(monitor.detection_tick);
+    }
+    hash.unsigned_integer(handled_failures_.size());
+    for (const auto& failed : handled_failures_) {
+        hash.text(failed);
+    }
+    hash.unsigned_integer(task_reassignments_.size());
+    for (const auto& reassignment : task_reassignments_) {
+        hash.text(reassignment.task_id());
+        hash.text(reassignment.failed_agent_id());
+        hash.text(reassignment.new_agent_id());
+        hash.unsigned_integer(reassignment.commit_tick());
+        hash.boolean(reassignment.complete());
     }
     state_hash_ = hash.finish();
     tick_hashes_.push_back(state_hash_);
