@@ -1,152 +1,160 @@
-#include <sentinel/core/scenario.hpp>
-
 #include "test_helpers.hpp"
+
+#include <sentinel/core/scenario.hpp>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 
-TEST(Scenario, HashCanonicalizesOrderInsensitiveCollections) {
-    auto first = sentinel::test::baseline_scenario();
-    auto* second_profile = first.add_network_profiles();
-    second_profile->set_id("backup");
-    second_profile->set_latency_ticks(2);
-    first.mutable_vehicles(0)->add_capabilities(
-        sentinel::v1::CAPABILITY_INSPECTION);
-    first.mutable_vehicles(0)->add_terrain_access("paved");
-    first.mutable_vehicles(0)->add_terrain_access("gravel");
-
-    auto reordered = first;
-    std::reverse(reordered.mutable_network_profiles()->begin(),
-                 reordered.mutable_network_profiles()->end());
-    std::reverse(reordered.mutable_vehicles(0)->mutable_capabilities()->begin(),
-                 reordered.mutable_vehicles(0)->mutable_capabilities()->end());
-    std::reverse(reordered.mutable_vehicles(0)->mutable_terrain_access()->begin(),
-                 reordered.mutable_vehicles(0)->mutable_terrain_access()->end());
-
-    EXPECT_EQ(sentinel::core::scenario_hash(first),
-              sentinel::core::scenario_hash(reordered));
+TEST(Scenario, LoadsAndNormalizesBasicMission) {
+    const auto scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    EXPECT_EQ(scenario.schema_version(), 1U);
+    EXPECT_EQ(scenario.vehicles_size(), 4);
+    EXPECT_EQ(scenario.tasks_size(), 4);
+    EXPECT_EQ(scenario.events_size(), 4);
+    EXPECT_EQ(scenario.failure_detection_ticks(), 5U);
+    EXPECT_LT(scenario.vehicles(0).id(), scenario.vehicles(1).id());
+    EXPECT_LT(scenario.tasks(0).id(), scenario.tasks(1).id());
 }
 
-TEST(Scenario, RejectsMissingAndInfeasibleTaskOwners) {
-    auto scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_tasks(0)->set_assigned_agent_id("missing");
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
-
-    scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_tasks(0)->set_required_capability(
-        sentinel::v1::CAPABILITY_DELIVERY);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
-
-    scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_tasks(0)->set_payload_required_grams(1001);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+TEST(Scenario, AcceptsVehicleDegradationEvents) {
+    for (const auto kind : {sentinel::v1::TAPE_EVENT_KIND_SET_SPEED_PERMILLE,
+                            sentinel::v1::TAPE_EVENT_KIND_SET_ENDURANCE_PERMILLE}) {
+        auto scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+        auto* event = scenario.add_events();
+        event->set_id(kind == sentinel::v1::TAPE_EVENT_KIND_SET_SPEED_PERMILLE ? "speed-drop" : "endurance-drop");
+        event->set_tick(1);
+        event->set_kind(kind);
+        event->set_target_id(scenario.vehicles(0).id());
+        event->set_value_min(350);
+        event->set_value_max(700);
+        event->set_rng_stream(event->id());
+        EXPECT_NO_THROW(sentinel::core::validate_scenario(scenario));
+    }
 }
 
-TEST(Scenario, AcceptsUnassignedTaskWhenACapableVehicleExists) {
-    auto scenario = sentinel::test::baseline_scenario();
-    scenario.set_allocation_policy(
-        sentinel::v1::ALLOCATION_POLICY_NEAREST_CAPABLE);
-    scenario.mutable_tasks(0)->clear_assigned_agent_id();
-    EXPECT_NO_THROW(sentinel::core::validate_scenario(scenario));
+TEST(Scenario, RejectsInvalidFailureDetectionAndDegradationEvents) {
+    auto scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    scenario.set_failure_detection_ticks(scenario.max_ticks() + 1);
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
 
-    scenario.mutable_tasks(0)->set_required_capability(
-        sentinel::v1::CAPABILITY_DELIVERY);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+    const auto invalid = [](auto change) {
+        auto value = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+        auto* event = value.add_events();
+        event->set_id("speed-drop");
+        event->set_tick(1);
+        event->set_kind(sentinel::v1::TAPE_EVENT_KIND_SET_SPEED_PERMILLE);
+        event->set_target_id(value.vehicles(0).id());
+        event->set_value_min(350);
+        event->set_value_max(650);
+        event->set_rng_stream("speed-drop");
+        change(*event);
+        EXPECT_THROW(sentinel::core::validate_scenario(value), std::invalid_argument);
+    };
+    invalid([](auto& event) { event.set_target_id("missing-agent"); });
+    invalid([](auto& event) { event.set_value_min(0); });
+    invalid([](auto& event) { event.set_value_max(1001); });
+    invalid([](auto& event) {
+        event.set_value_min(700);
+        event.set_value_max(600);
+    });
+    invalid([](auto& event) { event.clear_rng_stream(); });
 }
 
-TEST(Scenario, RejectsDuplicateIdentifiersAcrossScenarioCollections) {
-    auto scenario = sentinel::test::baseline_scenario();
-    scenario.add_vehicles()->CopyFrom(scenario.vehicles(0));
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
-
-    scenario = sentinel::test::baseline_scenario();
-    scenario.add_network_profiles()->CopyFrom(scenario.network_profiles(0));
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
-
-    scenario = sentinel::test::baseline_scenario();
-    scenario.add_tasks()->CopyFrom(scenario.tasks(0));
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+TEST(Scenario, HashIgnoresInputOrdering) {
+    const auto scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    auto reversed = scenario;
+    std::reverse(reversed.mutable_vehicles()->begin(), reversed.mutable_vehicles()->end());
+    std::reverse(reversed.mutable_tasks()->begin(), reversed.mutable_tasks()->end());
+    std::reverse(reversed.mutable_events()->begin(), reversed.mutable_events()->end());
+    std::reverse(reversed.mutable_world()->mutable_regions()->begin(),
+                 reversed.mutable_world()->mutable_regions()->end());
+    EXPECT_EQ(sentinel::core::scenario_hash(scenario), sentinel::core::scenario_hash(reversed));
 }
 
-TEST(Scenario, RejectsCoordinatesOutsideTheWorldOrOffTheGrid) {
-    auto scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_vehicles(0)->mutable_initial_position()->set_x_mm(-1);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
-
-    scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_tasks(0)->mutable_target()->set_x_mm(10'001);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
-
-    scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_tasks(0)->mutable_target()->set_x_mm(500);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+TEST(Scenario, RejectsInvalidAgentCountAndAssignments) {
+    auto scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    while (scenario.vehicles_size() > 2) {
+        scenario.mutable_vehicles()->RemoveLast();
+    }
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    scenario.mutable_tasks(0)->set_assigned_agent_id("missing-agent");
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
 }
 
-TEST(Scenario, RejectsInvalidWorldAndClockBounds) {
-    auto scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_world()->set_grid_cell_mm(3);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
-
-    scenario = sentinel::test::baseline_scenario();
-    scenario.set_step_ms(60'001);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
-
-    scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_world()->set_width_mm(1'000'000'001);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+TEST(Scenario, RejectsIncapableAndOverloadedAssignments) {
+    auto scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    auto task = std::find_if(scenario.mutable_tasks()->begin(), scenario.mutable_tasks()->end(), [](const auto& value) {
+        return value.id() == "search-sector-a";
+    });
+    ASSERT_NE(task, scenario.mutable_tasks()->end());
+    task->set_required_capability(sentinel::v1::CAPABILITY_DELIVERY);
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    task = std::find_if(scenario.mutable_tasks()->begin(), scenario.mutable_tasks()->end(), [](const auto& value) {
+        return value.id() == "search-sector-a";
+    });
+    ASSERT_NE(task, scenario.mutable_tasks()->end());
+    task->set_payload_required_grams(1001);
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
 }
 
-TEST(Scenario, RejectsUnknownServiceAndEventReferences) {
-    auto scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_vehicles(0)->set_return_location_id("home");
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+TEST(Scenario, RejectsArithmeticOverflowInputs) {
+    auto scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    scenario.set_step_ms(60001);
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
 
-    scenario = sentinel::test::baseline_scenario();
-    auto* event = scenario.add_events();
-    event->set_id("release");
-    event->set_tick(2);
-    event->set_kind(sentinel::v1::TAPE_EVENT_KIND_RELEASE_TASK);
-    event->set_target_id("missing");
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    scenario.mutable_world()->set_width_mm(1000000001);
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
 
-    scenario = sentinel::test::baseline_scenario();
-    event = scenario.add_events();
-    event->set_id("switch-profile");
-    event->set_tick(2);
-    event->set_kind(sentinel::v1::TAPE_EVENT_KIND_SET_NETWORK_PROFILE);
-    event->set_text_value("missing");
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    scenario.mutable_vehicles(0)->set_max_speed_mm_s(1000001);
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
+
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    auto event = std::find_if(scenario.mutable_events()->begin(), scenario.mutable_events()->end(), [](const auto& value) {
+        return value.kind() == sentinel::v1::TAPE_EVENT_KIND_ENERGY_DELTA;
+    });
+    ASSERT_NE(event, scenario.mutable_events()->end());
+    event->set_value_min(1000000000000000);
+    event->set_value_max(1000000000000000);
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
 }
 
-TEST(Scenario, RejectsUnknownEnumsAndDuplicateCapabilities) {
-    auto scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_vehicles(0)->set_capabilities(
-        0, static_cast<sentinel::v1::Capability>(99));
-    scenario.mutable_tasks(0)->set_required_capability(
-        static_cast<sentinel::v1::Capability>(99));
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+TEST(Scenario, RejectsUnknownEnumsAndEmptyTerrainLabels) {
+    auto scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    scenario.mutable_world()->mutable_regions(0)->set_kind(static_cast<sentinel::v1::RegionKind>(99));
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
 
-    scenario = sentinel::test::baseline_scenario();
-    scenario.mutable_vehicles(0)->add_capabilities(
-        sentinel::v1::CAPABILITY_SEARCH);
-    EXPECT_THROW(sentinel::core::validate_scenario(scenario),
-                 std::invalid_argument);
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    scenario.mutable_events(0)->set_kind(static_cast<sentinel::v1::TapeEventKind>(99));
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
+
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    auto& task = *scenario.mutable_tasks(0);
+    auto vehicle = std::find_if(scenario.mutable_vehicles()->begin(), scenario.mutable_vehicles()->end(),
+                                [&task](const auto& value) {
+                                    return value.id() == task.assigned_agent_id();
+                                });
+    ASSERT_NE(vehicle, scenario.mutable_vehicles()->end());
+    const auto unknown = static_cast<sentinel::v1::Capability>(99);
+    task.set_required_capability(unknown);
+    vehicle->add_capabilities(unknown);
+    sentinel::core::normalize_scenario(scenario);
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
+
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    auto terrain = std::find_if(scenario.mutable_world()->mutable_regions()->begin(),
+                                scenario.mutable_world()->mutable_regions()->end(), [](const auto& region) {
+                                    return region.kind() == sentinel::v1::REGION_KIND_TERRAIN;
+                                });
+    ASSERT_NE(terrain, scenario.mutable_world()->mutable_regions()->end());
+    terrain->clear_terrain();
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
+
+    scenario = sentinel::core::load_scenario(sentinel::test::nominal_scenario_path());
+    scenario.mutable_vehicles(0)->set_terrain_access(0, "");
+    EXPECT_THROW(sentinel::core::validate_scenario(scenario), std::invalid_argument);
 }

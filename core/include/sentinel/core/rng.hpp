@@ -30,6 +30,7 @@ private:
         std::string name;
         DeterministicRng rng;
     };
+
     std::uint64_t root_seed_{};
     std::vector<Entry> entries_;
 };

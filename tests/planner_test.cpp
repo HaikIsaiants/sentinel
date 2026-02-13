@@ -76,7 +76,7 @@ void expect_coordinate(const sentinel::planning::Coordinate& value, std::int64_t
 TEST(Planner, CanonicalPathIsStableAcrossRegionOrder) {
     auto first_world = world();
     add_region(first_world, "center", sentinel::v1::REGION_KIND_OBSTACLE, 2000, 2000, 2000, 2000);
-    add_region(first_world, "corner", sentinel::v1::REGION_KIND_OBSTACLE, 4000, 4000, 4000, 4000);
+    add_region(first_world, "corner", sentinel::v1::REGION_KIND_CHOKEPOINT, 4000, 4000, 4000, 4000);
     auto second_world = first_world;
     std::reverse(second_world.mutable_regions()->begin(), second_world.mutable_regions()->end());
     const auto current = vehicle("agent", 0, 2000);
@@ -112,6 +112,12 @@ TEST(Planner, AppliesRegionAndTerrainRules) {
         add_region(blocked, "blocked", kind, 1000, 0, 1000, 0);
         EXPECT_FALSE(sentinel::planning::segment_allowed(blocked, current, from, to));
     }
+    auto chokepoint = world(1000, 1000);
+    auto* passage = add_region(chokepoint, "passage", sentinel::v1::REGION_KIND_CHOKEPOINT, 1000, 0, 1000, 0);
+    EXPECT_TRUE(sentinel::planning::segment_allowed(chokepoint, current, from, to));
+    passage->set_closed(true);
+    EXPECT_FALSE(sentinel::planning::segment_allowed(chokepoint, current, from, to));
+
     auto terrain_world = world(4000, 1000);
     auto* mud = add_region(terrain_world, "mud", sentinel::v1::REGION_KIND_TERRAIN, 2000, 0, 2000, 1000);
     mud->set_terrain("mud");

@@ -355,7 +355,7 @@ public:
 private:
     void validate_observation(const v1::AgentObservation& observation) const {
         if (observation.self().id() != agent_id_ || observation.allocation_epoch() == 0
-            || observation.step_ms() == 0
+            || observation.world().map_version() == 0 || observation.step_ms() == 0
             || !valid_policy(observation.allocation_policy())) {
             throw std::invalid_argument("invalid allocator observation");
         }

@@ -25,12 +25,9 @@ enum TapeEventKind {
   TAPE_EVENT_KIND_ENERGY_DELTA = 3;
   TAPE_EVENT_KIND_SET_NETWORK_PROFILE = 4;
   TAPE_EVENT_KIND_SET_REGION_CLOSED = 5;
-}
-
-enum LocationKind {
-  LOCATION_KIND_UNSPECIFIED = 0;
-  LOCATION_KIND_CHARGING = 1;
-  LOCATION_KIND_RETURN = 2;
+  TAPE_EVENT_KIND_SET_LINK_BLOCKED = 6;
+  TAPE_EVENT_KIND_SET_SPEED_PERMILLE = 7;
+  TAPE_EVENT_KIND_SET_ENDURANCE_PERMILLE = 8;
 }
 
 enum TaskStatus {
@@ -38,6 +35,12 @@ enum TaskStatus {
   TASK_STATUS_PENDING = 1;
   TASK_STATUS_COMPLETED = 2;
   TASK_STATUS_MISSED = 3;
+}
+
+enum LocationKind {
+  LOCATION_KIND_UNSPECIFIED = 0;
+  LOCATION_KIND_CHARGING = 1;
+  LOCATION_KIND_RETURN = 2;
 }
 
 enum AllocationPolicy {
@@ -50,6 +53,8 @@ enum AllocationPolicy {
 enum NetworkDisposition {
   NETWORK_DISPOSITION_UNSPECIFIED = 0;
   NETWORK_DISPOSITION_QUEUED = 1;
+  NETWORK_DISPOSITION_DROPPED_LOSS = 2;
+  NETWORK_DISPOSITION_DROPPED_PARTITION = 3;
   NETWORK_DISPOSITION_DELIVERED = 4;
 }
 
@@ -113,6 +118,11 @@ message World {
 message NetworkProfile {
   string id = 1;
   uint64 latency_ticks = 2;
+  uint64 jitter_ticks = 3;
+  uint32 packet_loss_permyriad = 4;
+  uint64 bandwidth_bytes_per_tick = 5;
+  uint32 reorder_permyriad = 6;
+  uint32 reorder_window_ticks = 7;
 }
 
 message VehicleSpec {
@@ -257,23 +267,6 @@ message AllocationState {
   repeated AllocationRelay winner_relays = 9;
 }
 
-message RoutePlan {
-  uint64 version = 1;
-  uint64 map_version = 2;
-  string goal = 3;
-  repeated Point waypoints = 4;
-}
-
-message SpaceTimeReservation {
-  string resource_id = 1;
-  string agent_id = 2;
-  uint64 start_tick = 3;
-  uint64 end_tick = 4;
-  uint64 version = 5;
-  uint64 route_version = 6;
-  uint64 map_version = 7;
-}
-
 message TaskReport {
   string task_id = 1;
   TaskReportKind kind = 2;
@@ -296,6 +289,8 @@ message NetworkOutcome {
   uint64 transmit_start_tick = 7;
   uint64 transmit_end_tick = 8;
   uint64 delivery_tick = 9;
+  sint64 jitter_ticks = 10;
+  bool reordered = 11;
   string profile_id = 12;
 }
 
@@ -304,6 +299,17 @@ message AllocationConvergence {
   uint64 start_tick = 2;
   uint64 end_tick = 3;
   bool complete = 4;
+}
+
+message SpaceTimeReservation {
+  // Both endpoint ticks belong to the reservation window.
+  string resource_id = 1;
+  string agent_id = 2;
+  uint64 start_tick = 3;
+  uint64 end_tick = 4;
+  uint64 version = 5;
+  uint64 route_version = 6;
+  uint64 map_version = 7;
 }
 
 message FailureDetection {
@@ -335,6 +341,13 @@ message ReplanningSample {
   uint64 end_tick = 4;
   bool wait_plan = 5;
   bool complete = 6;
+}
+
+message RoutePlan {
+  uint64 version = 1;
+  uint64 map_version = 2;
+  string goal = 3;
+  repeated Point waypoints = 4;
 }
 
 message AgentObservation {
@@ -410,12 +423,22 @@ message SimulationSummary {
   uint64 communication_bytes = 16;
   uint64 communication_messages = 17;
   uint64 delivered_messages = 18;
+  uint64 dropped_messages = 19;
+  uint64 reordered_messages = 20;
   repeated AllocationConvergence allocation_convergence = 21;
   repeated FailureDetection failure_detections = 22;
   repeated TaskReassignment task_reassignments = 23;
   repeated ReplanningSample replanning_samples = 24;
   uint64 maximum_reassignment_delay_ms = 25;
   uint32 missing_reassignments = 26;
+  bool agent_energy_never_drops_below_zero = 27;
+  uint64 agent_energy_below_zero_violations = 28;
+  bool committed_reservations_never_overlap = 29;
+  uint64 committed_reservation_overlap_violations = 30;
+  bool completed_tasks_are_never_reassigned = 31;
+  uint64 completed_task_reassignment_violations = 32;
+  bool incapable_agents_never_commit_tasks = 33;
+  uint64 incapable_agent_commit_violations = 34;
 }
 
 message ObservationBatch {

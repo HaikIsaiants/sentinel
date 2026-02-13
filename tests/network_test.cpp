@@ -1,189 +1,206 @@
 #include <sentinel/core/network.hpp>
+#include <sentinel/protocol/framing.hpp>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <string>
-#include <utility>
+#include <vector>
 
 namespace {
 
-sentinel::v1::NetworkProfile profile(
-    std::uint64_t latency_ticks = 0) {
+sentinel::v1::NetworkProfile profile(const char* id, std::uint64_t latency, std::uint64_t jitter,
+                                     std::uint32_t loss, std::uint64_t bandwidth,
+                                     std::uint32_t reorder = 0, std::uint32_t window = 0) {
     sentinel::v1::NetworkProfile result;
-    result.set_id(
-        latency_ticks == 0 ? "local" : "delayed");
-    result.set_latency_ticks(latency_ticks);
+    result.set_id(id);
+    result.set_latency_ticks(latency);
+    result.set_jitter_ticks(jitter);
+    result.set_packet_loss_permyriad(loss);
+    result.set_bandwidth_bytes_per_tick(bandwidth);
+    result.set_reorder_permyriad(reorder);
+    result.set_reorder_window_ticks(window);
     return result;
 }
 
-sentinel::v1::NetworkMessage message(
-    std::string sender, std::string recipient,
-    std::uint64_t version) {
+sentinel::v1::NetworkMessage message(const char* sender, const char* recipient, const char* payload,
+                                     std::uint64_t version = 1) {
     sentinel::v1::NetworkMessage result;
-    result.set_sender_id(std::move(sender));
-    result.set_recipient_id(std::move(recipient));
+    result.set_sender_id(sender);
+    result.set_recipient_id(recipient);
     result.set_version(version);
-    result.set_payload("allocation-state");
+    result.set_payload(payload);
     return result;
 }
 
-sentinel::v1::NetworkMessage message(
-    std::uint64_t version) {
-    return message("agent-a", "agent-b", version);
+std::uint64_t serialized_bytes(const sentinel::v1::NetworkMessage& message, std::uint64_t sequence,
+                               std::uint64_t tick, std::uint64_t step_ms) {
+    sentinel::v1::Envelope envelope;
+    envelope.set_schema_version(1);
+    envelope.set_sequence(sequence);
+    envelope.set_simulation_time_ms(tick * step_ms);
+    envelope.set_sender_id(message.sender_id());
+    envelope.set_recipient_id(message.recipient_id());
+    envelope.mutable_message()->CopyFrom(message);
+    return sentinel::protocol::deterministic_bytes(envelope).size();
+}
+
+const sentinel::v1::NetworkOutcome* disposition(const sentinel::core::NetworkStep& step,
+                                                sentinel::v1::NetworkDisposition value,
+                                                std::uint64_t sequence) {
+    const auto position = std::find_if(step.outcomes.begin(), step.outcomes.end(), [value, sequence](const auto& item) {
+        return item.disposition() == value && item.sequence() == sequence;
+    });
+    return position == step.outcomes.end() ? nullptr : &*position;
+}
+
+std::string state(const sentinel::core::NetworkEmulator& network) {
+    sentinel::core::HashBuilder hash;
+    network.append_hash(hash);
+    return hash.finish();
 }
 
 }
 
-TEST(Network, RequiresASelectedProfileBeforeStepping) {
-    sentinel::core::NetworkEmulator network(17, 100);
-    EXPECT_THROW(network.step(0, {}), std::logic_error);
+TEST(NetworkEmulator, CanonicalizesAttemptsAndCountsExactEnvelopes) {
+    const auto first = message("alpha", "bravo", "a");
+    const auto second = message("alpha", "bravo", "b");
+    sentinel::core::NetworkEmulator forward(17, 100);
+    sentinel::core::NetworkEmulator reverse(17, 100);
+    const auto perfect = profile("perfect", 0, 0, 0, 10000);
+    forward.set_profile(perfect);
+    reverse.set_profile(perfect);
+
+    const auto left = forward.step(0, {second, first});
+    const auto right = reverse.step(0, {first, second});
+    ASSERT_EQ(left.delivered.size(), 2U);
+    ASSERT_EQ(left.outcomes.size(), 4U);
+    EXPECT_EQ(left.delivered[0].payload(), "a");
+    EXPECT_EQ(left.delivered[1].payload(), "b");
+    EXPECT_EQ(left.outcomes[0].serialized_bytes(), serialized_bytes(first, 1, 0, 100));
+    EXPECT_EQ(left.outcomes[1].serialized_bytes(), serialized_bytes(second, 2, 0, 100));
+    EXPECT_EQ(forward.communication_bytes(), left.outcomes[0].serialized_bytes() + left.outcomes[1].serialized_bytes());
+    EXPECT_EQ(forward.communication_messages(), 2U);
+    EXPECT_EQ(forward.delivered_messages(), 2U);
+    EXPECT_EQ(forward.dropped_messages(), 0U);
+    ASSERT_EQ(left.outcomes.size(), right.outcomes.size());
+    for (std::size_t i = 0; i < left.outcomes.size(); ++i) {
+        EXPECT_EQ(sentinel::protocol::deterministic_bytes(left.outcomes[i]),
+                  sentinel::protocol::deterministic_bytes(right.outcomes[i]));
+    }
+    EXPECT_EQ(state(forward), state(reverse));
 }
 
-TEST(Network, DeliversAfterTheSelectedLatency) {
-    sentinel::core::NetworkEmulator network(17, 100);
-    network.set_profile(profile(2));
-    const auto admitted = network.step(0, {message(1)});
-    ASSERT_EQ(admitted.outcomes.size(), 1U);
-    EXPECT_EQ(
-        admitted.outcomes.front().disposition(),
-        sentinel::v1::NETWORK_DISPOSITION_QUEUED);
-    EXPECT_TRUE(network.step(1, {}).delivered.empty());
-    EXPECT_TRUE(network.step(2, {}).delivered.empty());
-    const auto delivered = network.step(3, {});
-    ASSERT_EQ(delivered.delivered.size(), 1U);
-    EXPECT_EQ(delivered.delivered.front().version(), 1);
-    ASSERT_EQ(delivered.outcomes.size(), 1U);
-    EXPECT_EQ(
-        delivered.outcomes.front().disposition(),
-        sentinel::v1::NETWORK_DISPOSITION_DELIVERED);
-}
-
-TEST(Network, ReleasesDueTrafficBeforeRecordingNewTraffic) {
+TEST(NetworkEmulator, SerializesAcrossTicksWithoutStarvation) {
+    const auto value = message("alpha", "bravo", "bandwidth");
+    const auto bytes = serialized_bytes(value, 1, 0, 100);
+    ASSERT_GT(bytes, 1U);
     sentinel::core::NetworkEmulator network(21, 100);
-    network.set_profile(profile());
-    network.step(0, {message(1)});
-    const auto step = network.step(1, {message(2)});
-    ASSERT_EQ(step.outcomes.size(), 2U);
-    EXPECT_EQ(
-        step.outcomes[0].disposition(),
-        sentinel::v1::NETWORK_DISPOSITION_DELIVERED);
-    EXPECT_EQ(step.outcomes[0].message().version(), 1);
-    EXPECT_EQ(
-        step.outcomes[1].disposition(),
-        sentinel::v1::NETWORK_DISPOSITION_QUEUED);
-    EXPECT_EQ(step.outcomes[1].message().version(), 2);
+    network.set_profile(profile("limited", 0, 0, 0, bytes - 1));
+
+    const auto first = network.step(0, {value});
+    EXPECT_TRUE(first.delivered.empty());
+    ASSERT_NE(disposition(first, sentinel::v1::NETWORK_DISPOSITION_QUEUED, 1), nullptr);
+    const auto second = network.step(1, {});
+    ASSERT_EQ(second.delivered.size(), 1U);
+    const auto* delivered = disposition(second, sentinel::v1::NETWORK_DISPOSITION_DELIVERED, 1);
+    ASSERT_NE(delivered, nullptr);
+    EXPECT_EQ(delivered->transmit_start_tick(), 0U);
+    EXPECT_EQ(delivered->transmit_end_tick(), 1U);
+    EXPECT_EQ(delivered->delivery_tick(), 2U);
 }
 
-TEST(Network, RejectsTheWholeBatchBeforeMutatingCounters) {
-    sentinel::core::NetworkEmulator network(21, 100);
-    network.set_profile(profile());
-    auto invalid = message(2);
-    invalid.clear_recipient_id();
-    EXPECT_THROW(
-        network.step(0, {message(1), invalid}),
-        std::invalid_argument);
-    EXPECT_EQ(network.communication_messages(), 0);
-    EXPECT_EQ(network.communication_bytes(), 0);
-    EXPECT_EQ(network.delivered_messages(), 0);
-    const auto accepted = network.step(0, {message(3)});
-    EXPECT_EQ(accepted.outcomes.front().sequence(), 1);
+TEST(NetworkEmulator, UsesIndependentDeterministicImpairmentDraws) {
+    const auto value = message("alpha", "bravo", "impaired");
+    sentinel::core::NetworkEmulator dropped(33, 100);
+    dropped.set_profile(profile("loss", 4, 3, 10000, 10000, 10000, 3));
+    const auto loss = dropped.step(0, {value});
+    ASSERT_EQ(loss.outcomes.size(), 1U);
+    EXPECT_EQ(loss.outcomes[0].disposition(), sentinel::v1::NETWORK_DISPOSITION_DROPPED_LOSS);
+    EXPECT_GE(loss.outcomes[0].jitter_ticks(), -3);
+    EXPECT_LE(loss.outcomes[0].jitter_ticks(), 3);
+    EXPECT_EQ(dropped.dropped_messages(), 1U);
+
+    sentinel::core::NetworkEmulator first(33, 100);
+    sentinel::core::NetworkEmulator second(33, 100);
+    const auto impaired = profile("reorder", 4, 3, 0, 10000, 10000, 3);
+    first.set_profile(impaired);
+    second.set_profile(impaired);
+    auto left = first.step(0, {value});
+    auto right = second.step(0, {value});
+    for (std::uint64_t tick = 1; left.delivered.empty() && tick < 12; ++tick) {
+        left = first.step(tick, {});
+        right = second.step(tick, {});
+    }
+    ASSERT_EQ(left.delivered.size(), 1U);
+    const auto* delivered = disposition(left, sentinel::v1::NETWORK_DISPOSITION_DELIVERED, 1);
+    const auto* repeated = disposition(right, sentinel::v1::NETWORK_DISPOSITION_DELIVERED, 1);
+    ASSERT_NE(delivered, nullptr);
+    ASSERT_NE(repeated, nullptr);
+    EXPECT_TRUE(delivered->reordered());
+    EXPECT_GE(delivered->delivery_tick(), 2U);
+    EXPECT_LE(delivered->delivery_tick(), 10U);
+    EXPECT_EQ(sentinel::protocol::deterministic_bytes(*delivered),
+              sentinel::protocol::deterministic_bytes(*repeated));
+    EXPECT_EQ(first.reordered_messages(), 1U);
 }
 
-TEST(Network, RejectsDuplicateMessagesWithinABatch) {
-    sentinel::core::NetworkEmulator network(21, 100);
-    network.set_profile(profile());
-    EXPECT_THROW(
-        network.step(0, {message(1), message(1)}),
-        std::invalid_argument);
-    EXPECT_EQ(network.communication_messages(), 0);
+TEST(NetworkEmulator, PartitionFlushesInflightPackets) {
+    sentinel::core::NetworkEmulator network(45, 100);
+    network.set_profile(profile("slow", 4, 0, 0, 10000));
+    const auto queued = network.step(0, {message("alpha", "bravo", "before")});
+    EXPECT_TRUE(queued.delivered.empty());
+    const auto cut = network.set_link_blocked("bravo", "alpha", true, 1);
+    ASSERT_EQ(cut.size(), 1U);
+    EXPECT_EQ(cut[0].sequence(), 1U);
+    EXPECT_EQ(cut[0].disposition(), sentinel::v1::NETWORK_DISPOSITION_DROPPED_PARTITION);
+    EXPECT_EQ(cut[0].delivery_tick(), 4U);
+    EXPECT_TRUE(network.link_blocked("alpha", "bravo"));
+    EXPECT_TRUE(network.link_blocked("bravo", "alpha"));
+
+    const auto blocked = network.step(1, {message("alpha", "bravo", "out"),
+                                          message("bravo", "alpha", "back")});
+    EXPECT_TRUE(blocked.delivered.empty());
+    ASSERT_EQ(blocked.outcomes.size(), 2U);
+    EXPECT_EQ(blocked.outcomes[0].disposition(), sentinel::v1::NETWORK_DISPOSITION_DROPPED_PARTITION);
+    EXPECT_EQ(blocked.outcomes[1].disposition(), sentinel::v1::NETWORK_DISPOSITION_DROPPED_PARTITION);
+    EXPECT_EQ(network.dropped_messages(), 3U);
+
+    EXPECT_TRUE(network.set_link_blocked("alpha", "bravo", false, 2).empty());
+    EXPECT_FALSE(network.link_blocked("alpha", "bravo"));
+    network.set_profile(profile("healed", 0, 0, 0, 10000));
+    const auto healed = network.step(2, {message("alpha", "bravo", "retry")});
+    ASSERT_EQ(healed.delivered.size(), 1U);
+    EXPECT_EQ(healed.delivered[0].payload(), "retry");
 }
 
-TEST(Network, AllowsDistinctVersionsBetweenTheSamePeers) {
-    sentinel::core::NetworkEmulator network(21, 100);
-    network.set_profile(profile());
-    const auto accepted =
-        network.step(0, {message(1), message(2)});
-    ASSERT_EQ(accepted.outcomes.size(), 2U);
-    EXPECT_EQ(accepted.outcomes[0].sequence(), 1);
-    EXPECT_EQ(accepted.outcomes[1].sequence(), 2);
-}
+TEST(NetworkEmulator, ProfileChangesDoNotRewriteInflightPackets) {
+    sentinel::core::NetworkEmulator network(57, 100);
+    network.set_profile(profile("old", 4, 0, 0, 10000));
+    network.step(0, {message("alpha", "bravo", "old")});
+    network.set_profile(profile("new", 0, 0, 0, 10000));
+    const auto fast = network.step(1, {message("alpha", "bravo", "new")});
+    ASSERT_EQ(fast.delivered.size(), 1U);
+    const auto* new_delivery = disposition(fast, sentinel::v1::NETWORK_DISPOSITION_DELIVERED, 2);
+    ASSERT_NE(new_delivery, nullptr);
+    EXPECT_EQ(new_delivery->profile_id(), "new");
+    EXPECT_EQ(new_delivery->delivery_tick(), 2U);
 
-TEST(Network, OrdersDeliveriesByRecipientSenderAndVersion) {
-    sentinel::core::NetworkEmulator network(21, 100);
-    network.set_profile(profile());
-    network.step(
-        0,
-        {
-            message("agent-z", "agent-b", 3),
-            message("agent-a", "agent-c", 2),
-            message("agent-a", "agent-b", 4),
-            message("agent-a", "agent-b", 1),
-        });
-    const auto delivered = network.step(1, {}).delivered;
-    ASSERT_EQ(delivered.size(), 4U);
-    EXPECT_EQ(delivered[0].recipient_id(), "agent-b");
-    EXPECT_EQ(delivered[0].sender_id(), "agent-a");
-    EXPECT_EQ(delivered[0].version(), 1);
-    EXPECT_EQ(delivered[1].version(), 4);
-    EXPECT_EQ(delivered[2].sender_id(), "agent-z");
-    EXPECT_EQ(delivered[3].recipient_id(), "agent-c");
-}
-
-TEST(Network, AccountsForAcceptedSerializedTraffic) {
-    sentinel::core::NetworkEmulator network(21, 100);
-    network.set_profile(profile());
-    const auto first = network.step(0, {message(1)});
-    const auto bytes =
-        first.outcomes.front().serialized_bytes();
-    network.step(1, {message(2)});
-    EXPECT_EQ(network.communication_messages(), 2);
-    EXPECT_EQ(network.communication_bytes(), bytes * 2);
-    EXPECT_EQ(network.delivered_messages(), 1);
     network.step(2, {});
-    EXPECT_EQ(network.delivered_messages(), 2);
+    const auto slow = network.step(3, {});
+    ASSERT_EQ(slow.delivered.size(), 1U);
+    const auto* old_delivery = disposition(slow, sentinel::v1::NETWORK_DISPOSITION_DELIVERED, 1);
+    ASSERT_NE(old_delivery, nullptr);
+    EXPECT_EQ(old_delivery->profile_id(), "old");
+    EXPECT_EQ(old_delivery->delivery_tick(), 4U);
 }
 
-TEST(Network, OutcomeCapturesTheAdmissionAndDeliveryTicks) {
-    sentinel::core::NetworkEmulator network(21, 100);
-    network.set_profile(profile(3));
-    const auto queued = network.step(4, {message(7)});
-    ASSERT_EQ(queued.outcomes.size(), 1U);
-    EXPECT_EQ(queued.outcomes[0].enqueue_tick(), 4);
-    EXPECT_EQ(queued.outcomes[0].delivery_tick(), 8);
-    EXPECT_EQ(queued.outcomes[0].profile_id(), "delayed");
-    const auto delivered = network.step(8, {});
-    ASSERT_EQ(delivered.outcomes.size(), 1U);
-    EXPECT_EQ(delivered.outcomes[0].tick(), 8);
-    EXPECT_EQ(delivered.outcomes[0].enqueue_tick(), 4);
-    EXPECT_EQ(delivered.outcomes[0].delivery_tick(), 8);
-}
-
-TEST(Network, ProducesAStableHashForEquivalentQueues) {
-    sentinel::core::NetworkEmulator first(9, 100);
-    sentinel::core::NetworkEmulator second(9, 100);
-    first.set_profile(profile(4));
-    second.set_profile(profile(4));
-    first.step(0, {message(1), message(2)});
-    second.step(0, {message(1), message(2)});
-    sentinel::core::HashBuilder left;
-    sentinel::core::HashBuilder right;
-    first.append_hash(left);
-    second.append_hash(right);
-    EXPECT_EQ(left.finish(), right.finish());
-}
-
-TEST(Network, IncludesQueuedPayloadInTheHash) {
-    sentinel::core::NetworkEmulator first(9, 100);
-    sentinel::core::NetworkEmulator second(9, 100);
-    first.set_profile(profile(4));
-    second.set_profile(profile(4));
-    auto changed = message(1);
-    changed.set_payload("different-state");
-    first.step(0, {message(1)});
-    second.step(0, {changed});
-    sentinel::core::HashBuilder left;
-    sentinel::core::HashBuilder right;
-    first.append_hash(left);
-    second.append_hash(right);
-    EXPECT_NE(left.finish(), right.finish());
+TEST(NetworkEmulator, RejectsInvalidInputs) {
+    sentinel::core::NetworkEmulator network(1, 100);
+    EXPECT_THROW(network.set_profile(profile("bad", 0, 0, 0, 0)), std::invalid_argument);
+    EXPECT_THROW(network.set_profile(profile("bad-reorder", 0, 0, 0, 100, 1, 0)), std::invalid_argument);
+    network.set_profile(profile("perfect", 0, 0, 0, 100));
+    EXPECT_THROW(network.step(0, {message("alpha", "alpha", "self")}), std::invalid_argument);
+    EXPECT_THROW(network.set_link_blocked("alpha", "alpha", true, 0), std::invalid_argument);
 }

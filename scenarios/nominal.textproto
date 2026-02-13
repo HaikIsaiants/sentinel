@@ -3,8 +3,6 @@ name: "nominal-scripted-mission"
 seed: 110382719
 step_ms: 100
 max_ticks: 100
-network_profile: "nominal"
-allocation_policy: ALLOCATION_POLICY_SCRIPTED
 world {
   width_mm: 10000
   height_mm: 8000
@@ -23,9 +21,6 @@ world {
     maximum { x_mm: 1500 y_mm: 7000 }
     energy_multiplier_permille: 1000
   }
-}
-network_profiles {
-  id: "nominal"
 }
 vehicles {
   id: "uav-alpha"
@@ -93,3 +88,4 @@ tasks {
   assigned_agent_id: "uav-charlie"
   released: true
 }
+network_profile: "nominal"

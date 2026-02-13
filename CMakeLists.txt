@@ -110,6 +110,9 @@ if(BUILD_TESTING)
         tests/trace_export_test.cpp
     )
     target_include_directories(sentinel_tests PRIVATE tests)
+    target_compile_definitions(
+        sentinel_tests
+        PRIVATE SENTINEL_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_link_libraries(sentinel_tests PRIVATE sentinel_core sentinel_agent_logic GTest::gtest_main)
     gtest_discover_tests(sentinel_tests)
     add_test(
