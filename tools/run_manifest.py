@@ -5,35 +5,43 @@ import json
 import os
 import pathlib
 import stat
-import time
+
+from benchmark_io import canonical_bytes, file_digest, validate_digest
 
 
-def digest(path: pathlib.Path) -> str:
-    value = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            value.update(block)
-    return value.hexdigest()
+EXCLUDED = {".git", "build", "out", "vcpkg_installed", "__pycache__"}
 
 
-def source_files(root: pathlib.Path) -> list[pathlib.Path]:
-    excluded = {".git", "build", "out", "vcpkg_installed", "__pycache__"}
-    files = []
+def source_files(root: pathlib.Path, excluded: tuple[pathlib.Path, ...] = ()) -> list[pathlib.Path]:
+    excluded = tuple(path.resolve() for path in excluded)
+    values = []
     for path in root.rglob("*"):
-        if not path.is_file() or any(part in excluded for part in path.relative_to(root).parts):
+        if not path.is_file() or any(part in EXCLUDED for part in path.relative_to(root).parts):
             continue
-        files.append(path)
-    return sorted(files, key=lambda path: path.relative_to(root).as_posix())
+        resolved = path.resolve()
+        if any(resolved == item or item in resolved.parents for item in excluded):
+            continue
+        values.append(path)
+    return sorted(values, key=lambda path: path.relative_to(root).as_posix())
+
+
+def tree_digest(root: pathlib.Path, files: list[pathlib.Path]) -> str:
+    value = hashlib.sha256()
+    for path in files:
+        value.update(path.relative_to(root).as_posix().encode())
+        value.update(b"\0")
+        value.update(file_digest(path).encode())
+        value.update(b"\n")
+    return value.hexdigest()
 
 
 def executable(path: pathlib.Path) -> dict:
     if not path.is_file():
         raise ValueError(f"missing executable: {path}")
-    mode = path.stat().st_mode
     return {
         "path": str(path.resolve()),
-        "sha256": digest(path),
-        "executable": bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)) or os.name == "nt",
+        "sha256": file_digest(path),
+        "mode": stat.S_IMODE(path.stat().st_mode),
     }
 
 
@@ -42,55 +50,52 @@ def create_manifest(
     runner: pathlib.Path,
     simulator: pathlib.Path,
     agent: pathlib.Path,
+    output: pathlib.Path,
+    workers: int,
+    timeout: float,
 ) -> dict:
-    files = source_files(root)
-    source = [
-        {"path": path.relative_to(root).as_posix(), "sha256": digest(path)}
-        for path in files
-    ]
-    tree = hashlib.sha256()
-    for entry in source:
-        tree.update(entry["path"].encode())
-        tree.update(b"\0")
-        tree.update(entry["sha256"].encode())
-        tree.update(b"\n")
-    manifest = {
-        "schema_version": 1,
-        "created_unix_seconds": int(time.time()),
-        "source_tree_sha256": tree.hexdigest(),
-        "source_files": source,
+    if workers <= 0 or timeout <= 0:
+        raise ValueError("invalid parallel execution settings")
+    files = source_files(root, (output,))
+    value = {
+        "schema_version": 2,
+        "source_tree_sha256": tree_digest(root, files),
+        "source_files": [{"path": path.relative_to(root).as_posix(), "sha256": file_digest(path)} for path in files],
         "executables": {
             "runner": executable(runner),
             "simulator": executable(simulator),
             "agent": executable(agent),
         },
+        "dispatch": {
+            "strategy": "bounded-subprocess",
+            "workers": workers,
+            "timeout_seconds": timeout,
+            "publication_order": "mission-identity",
+        },
     }
-    identity = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    manifest["run_id"] = hashlib.sha256(identity).hexdigest()
-    return manifest
+    value["run_id"] = hashlib.sha256(canonical_bytes(value)).hexdigest()
+    return value
 
 
-def write_manifest(path: pathlib.Path, manifest: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_manifest(path: pathlib.Path, value: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+    temporary.parent.mkdir(parents=True, exist_ok=True)
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     os.replace(temporary, path)
 
 
-def verify_manifest(path: pathlib.Path, root: pathlib.Path) -> dict:
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 1 or not manifest.get("run_id"):
-        raise ValueError("invalid run manifest")
-    current = {
-        item.relative_to(root).as_posix(): digest(item)
-        for item in source_files(root)
-        if item.resolve() != path.resolve()
-    }
-    recorded = {item["path"]: item["sha256"] for item in manifest["source_files"]}
+def verify_manifest(path: pathlib.Path, root: pathlib.Path, output: pathlib.Path) -> dict:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    run_id = validate_digest(value.get("run_id"))
+    identity = dict(value)
+    identity.pop("run_id")
+    if value.get("schema_version") != 2 or hashlib.sha256(canonical_bytes(identity)).hexdigest() != run_id:
+        raise ValueError("manifest identity mismatch")
+    files = source_files(root, (path, output))
+    if tree_digest(root, files) != value["source_tree_sha256"]:
+        raise ValueError("source tree differs from manifest")
+    current = {item.relative_to(root).as_posix(): file_digest(item) for item in files}
+    recorded = {item["path"]: item["sha256"] for item in value["source_files"]}
     if current != recorded:
-        raise ValueError("source tree differs from run manifest")
-    for value in manifest["executables"].values():
-        target = pathlib.Path(value["path"])
-        if digest(target) != value["sha256"]:
-            raise ValueError(f"executable changed: {target}")
-    return manifest
+        raise ValueError("source inventory differs from manifest")
+    return value

@@ -7,25 +7,10 @@ import pathlib
 import statistics
 from collections import defaultdict
 
+from benchmark_io import contained, file_digest
+
 
 ALLOCATORS = ("nearest", "cbba")
-REQUIRED = {
-    "identity",
-    "run_id",
-    "seed_id",
-    "seed",
-    "stratum",
-    "allocator",
-    "success",
-    "elapsed_seconds",
-    "ticks",
-    "completed_tasks",
-    "total_tasks",
-    "terminal_hash",
-    "scenario_sha256",
-    "artifacts",
-    "error",
-}
 
 
 def read_rows(paths: list[pathlib.Path]) -> list[dict]:
@@ -36,28 +21,30 @@ def read_rows(paths: list[pathlib.Path]) -> list[dict]:
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
-            value = json.loads(line)
-            missing = REQUIRED.difference(value)
-            if missing:
-                raise ValueError(f"{path}:{number} misses {sorted(missing)}")
-            if value["identity"] != f"{value['seed_id']}.{value['allocator']}":
-                raise ValueError(f"{path}:{number} has invalid identity")
-            identity = value["run_id"], value["identity"]
+            row = json.loads(line)
+            required = {
+                "identity",
+                "run_id",
+                "seed_id",
+                "stratum",
+                "allocator",
+                "success",
+                "ticks",
+                "elapsed_seconds",
+                "artifacts",
+                "attempt_processes",
+            }
+            if not isinstance(row, dict) or required.difference(row):
+                raise ValueError(f"invalid benchmark row at {path}:{number}")
+            identity = row["run_id"], row["identity"]
             if identity in identities:
-                raise ValueError(f"duplicate result {identity}")
+                raise ValueError(f"duplicate benchmark row {identity}")
             identities.add(identity)
-            run_ids.add(value["run_id"])
-            rows.append(value)
+            run_ids.add(row["run_id"])
+            rows.append(row)
     if not rows or len(run_ids) != 1:
-        raise ValueError("results must contain one non-empty run")
+        raise ValueError("analysis requires one non-empty run")
     return rows
-
-
-def nearest_rank(values: list[float], fraction: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
 
 
 def wilson_lower(successes: int, total: int, z: float = 1.96) -> float:
@@ -70,12 +57,18 @@ def wilson_lower(successes: int, total: int, z: float = 1.96) -> float:
     return max(0.0, (center - margin) / denominator)
 
 
+def nearest_rank(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
+
+
 def describe(rows: list[dict]) -> dict:
-    successes = [row for row in rows if row["success"]]
+    successes = [row for row in rows if row["success"] and not row.get("error")]
     ticks = [row["ticks"] for row in successes]
     elapsed = [float(row["elapsed_seconds"]) for row in rows]
-    completed = sum(row["completed_tasks"] for row in rows)
-    total_tasks = sum(row["total_tasks"] for row in rows)
+    threads = {row.get("dispatch_thread") for row in rows if row.get("dispatch_thread")}
     return {
         "missions": len(rows),
         "successes": len(successes),
@@ -85,7 +78,8 @@ def describe(rows: list[dict]) -> dict:
         "p95_ticks": nearest_rank(ticks, 0.95),
         "mean_elapsed_seconds": statistics.fmean(elapsed),
         "p95_elapsed_seconds": nearest_rank(elapsed, 0.95),
-        "task_completion_rate": completed / total_tasks if total_tasks else 0.0,
+        "attempt_processes": sum(row["attempt_processes"] for row in rows),
+        "dispatch_threads": len(threads),
     }
 
 
@@ -94,77 +88,102 @@ def paired(rows: list[dict]) -> dict:
     for row in rows:
         grouped[row["seed_id"]][row["allocator"]] = row
     pairs = [value for value in grouped.values() if set(value) == set(ALLOCATORS)]
-    candidate_wins = 0
-    baseline_wins = 0
-    ties = 0
-    tick_deltas = []
+    wins = losses = ties = 0
+    deltas = []
     for pair in pairs:
-        baseline = pair["nearest"]
-        candidate = pair["cbba"]
-        baseline_score = (bool(baseline["success"]), -baseline["ticks"])
-        candidate_score = (bool(candidate["success"]), -candidate["ticks"])
-        if candidate_score > baseline_score:
-            candidate_wins += 1
-        elif candidate_score < baseline_score:
-            baseline_wins += 1
+        nearest = pair["nearest"]
+        cbba = pair["cbba"]
+        left = (bool(nearest["success"]), -nearest["ticks"])
+        right = (bool(cbba["success"]), -cbba["ticks"])
+        if right > left:
+            wins += 1
+        elif right < left:
+            losses += 1
         else:
             ties += 1
-        if baseline["success"] and candidate["success"]:
-            tick_deltas.append(baseline["ticks"] - candidate["ticks"])
+        if nearest["success"] and cbba["success"]:
+            deltas.append(nearest["ticks"] - cbba["ticks"])
     return {
         "pairs": len(pairs),
-        "candidate_wins": candidate_wins,
-        "baseline_wins": baseline_wins,
+        "candidate_wins": wins,
+        "baseline_wins": losses,
         "ties": ties,
-        "candidate_win_wilson_lower_95": wilson_lower(candidate_wins, len(pairs)),
-        "mean_tick_improvement": statistics.fmean(tick_deltas) if tick_deltas else 0.0,
+        "mean_tick_improvement": statistics.fmean(deltas) if deltas else 0.0,
     }
 
 
-def analyze(rows: list[dict]) -> dict:
-    allocator_rows = defaultdict(list)
-    strata = defaultdict(lambda: defaultdict(list))
+def audit_artifacts(rows: list[dict], root: pathlib.Path) -> list[str]:
+    failures = []
     for row in rows:
+        for artifact in row["artifacts"]:
+            try:
+                path = contained(root, artifact["path"])
+            except (KeyError, ValueError):
+                failures.append(row["identity"])
+                break
+            if (
+                not path.is_file()
+                or path.stat().st_size != artifact.get("bytes")
+                or file_digest(path) != artifact.get("sha256")
+            ):
+                failures.append(row["identity"])
+                break
+    return sorted(set(failures))
+
+
+def analyze(rows: list[dict], artifact_failures: list[str] = ()) -> dict:
+    failures = set(artifact_failures)
+    effective = []
+    for row in rows:
+        value = dict(row)
+        if row["identity"] in failures:
+            value["success"] = False
+            value["error"] = "artifact verification failed"
+        effective.append(value)
+    allocators = defaultdict(list)
+    strata = defaultdict(lambda: defaultdict(list))
+    for row in effective:
         if row["allocator"] not in ALLOCATORS:
             raise ValueError("unexpected allocator")
-        allocator_rows[row["allocator"]].append(row)
+        allocators[row["allocator"]].append(row)
         strata[row["stratum"]][row["allocator"]].append(row)
-    if set(allocator_rows) != set(ALLOCATORS):
+    if set(allocators) != set(ALLOCATORS):
         raise ValueError("both allocators are required")
     return {
-        "schema_version": 2,
-        "run_id": rows[0]["run_id"],
-        "rows": len(rows),
-        "allocators": {name: describe(allocator_rows[name]) for name in ALLOCATORS},
+        "schema_version": 3,
+        "run_id": effective[0]["run_id"],
+        "rows": len(effective),
+        "artifact_failure_ids": sorted(failures),
+        "allocators": {name: describe(allocators[name]) for name in ALLOCATORS},
         "strata": {
             stratum: {name: describe(values[name]) for name in ALLOCATORS if values[name]}
             for stratum, values in sorted(strata.items())
         },
-        "paired": paired(rows),
+        "paired": paired(effective),
     }
 
 
 def markdown(report: dict) -> str:
     lines = [
-        "# Transactional benchmark report",
+        "# Bounded-parallel benchmark report",
         "",
         f"Run: `{report['run_id']}`",
         "",
-        "| Allocator | Missions | Success | Wilson lower | Mean ticks | P95 ticks |",
+        "| Allocator | Missions | Success | Mean ticks | P95 elapsed | Processes |",
         "|---|---:|---:|---:|---:|---:|",
     ]
     for name, value in report["allocators"].items():
         lines.append(
             f"| {name} | {value['missions']} | {value['success_rate']:.4f} | "
-            f"{value['success_wilson_lower_95']:.4f} | {value['mean_ticks']:.2f} | {value['p95_ticks']:.0f} |"
+            f"{value['mean_ticks']:.2f} | {value['p95_elapsed_seconds']:.3f} | {value['attempt_processes']} |"
         )
-    value = report["paired"]
+    pair = report["paired"]
     lines.extend(
         [
             "",
-            f"Paired missions: {value['pairs']}",
+            f"Paired missions: {pair['pairs']}",
             "",
-            f"CBBA wins: {value['candidate_wins']}; nearest wins: {value['baseline_wins']}; ties: {value['ties']}.",
+            f"CBBA wins: {pair['candidate_wins']}; nearest wins: {pair['baseline_wins']}; ties: {pair['ties']}.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -173,10 +192,13 @@ def markdown(report: dict) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("results", nargs="+", type=pathlib.Path)
+    parser.add_argument("--artifact-root", type=pathlib.Path)
     parser.add_argument("--json", type=pathlib.Path, required=True)
     parser.add_argument("--markdown", type=pathlib.Path)
     arguments = parser.parse_args()
-    report = analyze(read_rows(arguments.results))
+    rows = read_rows(arguments.results)
+    failures = audit_artifacts(rows, arguments.artifact_root) if arguments.artifact_root else []
+    report = analyze(rows, failures)
     arguments.json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     if arguments.markdown:
         arguments.markdown.write_text(markdown(report), encoding="utf-8", newline="\n")
