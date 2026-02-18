@@ -8,7 +8,10 @@ import statistics
 from collections import defaultdict
 
 
+ALLOCATORS = ("nearest", "cbba")
 REQUIRED = {
+    "identity",
+    "run_id",
     "seed_id",
     "seed",
     "stratum",
@@ -19,6 +22,8 @@ REQUIRED = {
     "completed_tasks",
     "total_tasks",
     "terminal_hash",
+    "scenario_sha256",
+    "artifacts",
     "error",
 }
 
@@ -26,128 +31,153 @@ REQUIRED = {
 def read_rows(paths: list[pathlib.Path]) -> list[dict]:
     rows = []
     identities = set()
+    run_ids = set()
     for path in paths:
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
-            row = json.loads(line)
-            missing = REQUIRED.difference(row)
+            value = json.loads(line)
+            missing = REQUIRED.difference(value)
             if missing:
-                raise ValueError(f"{path}:{number} is missing {sorted(missing)}")
-            identity = row["seed_id"], row["allocator"]
+                raise ValueError(f"{path}:{number} misses {sorted(missing)}")
+            if value["identity"] != f"{value['seed_id']}.{value['allocator']}":
+                raise ValueError(f"{path}:{number} has invalid identity")
+            identity = value["run_id"], value["identity"]
             if identity in identities:
                 raise ValueError(f"duplicate result {identity}")
             identities.add(identity)
-            rows.append(row)
-    if not rows:
-        raise ValueError("no benchmark rows")
+            run_ids.add(value["run_id"])
+            rows.append(value)
+    if not rows or len(run_ids) != 1:
+        raise ValueError("results must contain one non-empty run")
     return rows
 
 
-def percentile(values: list[float], fraction: float) -> float:
+def nearest_rank(values: list[float], fraction: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
-    rank = max(0, math.ceil(len(ordered) * fraction) - 1)
-    return ordered[rank]
+    return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
+
+
+def wilson_lower(successes: int, total: int, z: float = 1.96) -> float:
+    if total == 0:
+        return 0.0
+    probability = successes / total
+    denominator = 1 + z * z / total
+    center = probability + z * z / (2 * total)
+    margin = z * math.sqrt(probability * (1 - probability) / total + z * z / (4 * total * total))
+    return max(0.0, (center - margin) / denominator)
 
 
 def describe(rows: list[dict]) -> dict:
+    successes = [row for row in rows if row["success"]]
+    ticks = [row["ticks"] for row in successes]
     elapsed = [float(row["elapsed_seconds"]) for row in rows]
-    ticks = [int(row["ticks"]) for row in rows if row["success"]]
-    completion = [
-        row["completed_tasks"] / row["total_tasks"]
-        for row in rows
-        if row["total_tasks"]
-    ]
-    successes = sum(bool(row["success"]) for row in rows)
+    completed = sum(row["completed_tasks"] for row in rows)
+    total_tasks = sum(row["total_tasks"] for row in rows)
     return {
         "missions": len(rows),
-        "successes": successes,
-        "success_rate": successes / len(rows),
-        "mean_elapsed_seconds": statistics.fmean(elapsed),
-        "p95_elapsed_seconds": percentile(elapsed, 0.95),
+        "successes": len(successes),
+        "success_rate": len(successes) / len(rows),
+        "success_wilson_lower_95": wilson_lower(len(successes), len(rows)),
         "mean_ticks": statistics.fmean(ticks) if ticks else 0.0,
-        "mean_completion_rate": statistics.fmean(completion) if completion else 0.0,
+        "p95_ticks": nearest_rank(ticks, 0.95),
+        "mean_elapsed_seconds": statistics.fmean(elapsed),
+        "p95_elapsed_seconds": nearest_rank(elapsed, 0.95),
+        "task_completion_rate": completed / total_tasks if total_tasks else 0.0,
+    }
+
+
+def paired(rows: list[dict]) -> dict:
+    grouped = defaultdict(dict)
+    for row in rows:
+        grouped[row["seed_id"]][row["allocator"]] = row
+    pairs = [value for value in grouped.values() if set(value) == set(ALLOCATORS)]
+    candidate_wins = 0
+    baseline_wins = 0
+    ties = 0
+    tick_deltas = []
+    for pair in pairs:
+        baseline = pair["nearest"]
+        candidate = pair["cbba"]
+        baseline_score = (bool(baseline["success"]), -baseline["ticks"])
+        candidate_score = (bool(candidate["success"]), -candidate["ticks"])
+        if candidate_score > baseline_score:
+            candidate_wins += 1
+        elif candidate_score < baseline_score:
+            baseline_wins += 1
+        else:
+            ties += 1
+        if baseline["success"] and candidate["success"]:
+            tick_deltas.append(baseline["ticks"] - candidate["ticks"])
+    return {
+        "pairs": len(pairs),
+        "candidate_wins": candidate_wins,
+        "baseline_wins": baseline_wins,
+        "ties": ties,
+        "candidate_win_wilson_lower_95": wilson_lower(candidate_wins, len(pairs)),
+        "mean_tick_improvement": statistics.fmean(tick_deltas) if tick_deltas else 0.0,
     }
 
 
 def analyze(rows: list[dict]) -> dict:
-    groups = defaultdict(list)
-    paired = defaultdict(dict)
+    allocator_rows = defaultdict(list)
+    strata = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        groups[row["allocator"]].append(row)
-        paired[row["seed_id"]][row["allocator"]] = row
-    allocators = sorted(groups)
-    complete_pairs = [
-        values
-        for values in paired.values()
-        if set(values) == set(allocators)
-    ]
-    comparison = {}
-    if len(allocators) == 2 and complete_pairs:
-        first, second = allocators
-        wins = 0
-        ties = 0
-        for pair in complete_pairs:
-            left = pair[first]
-            right = pair[second]
-            left_score = (bool(left["success"]), -int(left["ticks"]))
-            right_score = (bool(right["success"]), -int(right["ticks"]))
-            if right_score > left_score:
-                wins += 1
-            elif right_score == left_score:
-                ties += 1
-        comparison = {
-            "baseline": first,
-            "candidate": second,
-            "pairs": len(complete_pairs),
-            "candidate_wins": wins,
-            "ties": ties,
-        }
+        if row["allocator"] not in ALLOCATORS:
+            raise ValueError("unexpected allocator")
+        allocator_rows[row["allocator"]].append(row)
+        strata[row["stratum"]][row["allocator"]].append(row)
+    if set(allocator_rows) != set(ALLOCATORS):
+        raise ValueError("both allocators are required")
     return {
+        "schema_version": 2,
+        "run_id": rows[0]["run_id"],
         "rows": len(rows),
-        "allocators": {name: describe(groups[name]) for name in allocators},
-        "comparison": comparison,
+        "allocators": {name: describe(allocator_rows[name]) for name in ALLOCATORS},
+        "strata": {
+            stratum: {name: describe(values[name]) for name in ALLOCATORS if values[name]}
+            for stratum, values in sorted(strata.items())
+        },
+        "paired": paired(rows),
     }
 
 
 def markdown(report: dict) -> str:
-    lines = ["# Benchmark report", "", f"Rows: {report['rows']}", ""]
-    lines.append("| Allocator | Missions | Success | Mean ticks |")
-    lines.append("|---|---:|---:|---:|")
-    for name, values in report["allocators"].items():
+    lines = [
+        "# Transactional benchmark report",
+        "",
+        f"Run: `{report['run_id']}`",
+        "",
+        "| Allocator | Missions | Success | Wilson lower | Mean ticks | P95 ticks |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for name, value in report["allocators"].items():
         lines.append(
-            f"| {name} | {values['missions']} | {values['success_rate']:.3f} | "
-            f"{values['mean_ticks']:.2f} |"
+            f"| {name} | {value['missions']} | {value['success_rate']:.4f} | "
+            f"{value['success_wilson_lower_95']:.4f} | {value['mean_ticks']:.2f} | {value['p95_ticks']:.0f} |"
         )
-    comparison = report.get("comparison") or {}
-    if comparison:
-        lines.extend(
-            [
-                "",
-                (
-                    f"{comparison['candidate']} beat {comparison['baseline']} on "
-                    f"{comparison['candidate_wins']} of {comparison['pairs']} paired missions "
-                    f"with {comparison['ties']} ties."
-                ),
-            ]
-        )
+    value = report["paired"]
+    lines.extend(
+        [
+            "",
+            f"Paired missions: {value['pairs']}",
+            "",
+            f"CBBA wins: {value['candidate_wins']}; nearest wins: {value['baseline_wins']}; ties: {value['ties']}.",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("results", nargs="+", type=pathlib.Path)
-    parser.add_argument("--json", type=pathlib.Path)
+    parser.add_argument("--json", type=pathlib.Path, required=True)
     parser.add_argument("--markdown", type=pathlib.Path)
     arguments = parser.parse_args()
     report = analyze(read_rows(arguments.results))
-    payload = json.dumps(report, indent=2, sort_keys=True) + "\n"
-    if arguments.json:
-        arguments.json.write_text(payload, encoding="utf-8", newline="\n")
-    else:
-        print(payload, end="")
+    arguments.json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     if arguments.markdown:
         arguments.markdown.write_text(markdown(report), encoding="utf-8", newline="\n")
 
