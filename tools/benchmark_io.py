@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import pathlib
 import re
 
@@ -28,16 +27,6 @@ def validate_digest(value: str) -> str:
     return value
 
 
-def atomic_write(path: pathlib.Path, value: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    with temporary.open("wb") as stream:
-        stream.write(value)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-
-
 def contained(root: pathlib.Path, relative: str) -> pathlib.Path:
     if not relative or pathlib.PurePosixPath(relative).is_absolute():
         raise ValueError("artifact path must be relative")
@@ -47,3 +36,37 @@ def contained(root: pathlib.Path, relative: str) -> pathlib.Path:
     except ValueError as error:
         raise ValueError("artifact path escapes output root") from error
     return target
+
+
+def output_record_path(path: pathlib.Path, run_id: str) -> pathlib.Path:
+    validate_digest(run_id)
+    return path.with_name(f"{path.name}.{run_id}.record.json")
+
+
+def write_output_record(path: pathlib.Path, run_id: str, rows_sha256: str, artifacts_sha256: str) -> pathlib.Path:
+    record = {
+        "schema_version": 1,
+        "run_id": validate_digest(run_id),
+        "results": path.name,
+        "rows_sha256": validate_digest(rows_sha256),
+        "artifacts_sha256": validate_digest(artifacts_sha256),
+    }
+    target = output_record_path(path, run_id)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_bytes(canonical_bytes(record))
+    temporary.replace(target)
+    return target
+
+
+def read_output_record(path: pathlib.Path, run_id: str) -> dict:
+    target = output_record_path(path, run_id)
+    value = json.loads(target.read_text(encoding="utf-8"))
+    if (
+        value.get("schema_version") != 1
+        or value.get("run_id") != run_id
+        or value.get("results") != path.name
+    ):
+        raise ValueError("output record identity mismatch")
+    validate_digest(value.get("rows_sha256"))
+    validate_digest(value.get("artifacts_sha256"))
+    return value

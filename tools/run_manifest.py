@@ -6,23 +6,25 @@ import os
 import pathlib
 import stat
 
-from benchmark_io import canonical_bytes, file_digest, validate_digest
+from benchmark_io import canonical_bytes, file_digest, read_output_record, validate_digest
 
 
 EXCLUDED = {".git", "build", "out", "vcpkg_installed", "__pycache__"}
 
 
+def skipped(path: pathlib.Path, root: pathlib.Path, excluded: tuple[pathlib.Path, ...] = ()) -> bool:
+    relative = path.relative_to(root)
+    if any(part in EXCLUDED for part in relative.parts):
+        return True
+    resolved = path.resolve()
+    return any(resolved == item.resolve() or item.resolve() in resolved.parents for item in excluded)
+
+
 def source_files(root: pathlib.Path, excluded: tuple[pathlib.Path, ...] = ()) -> list[pathlib.Path]:
-    excluded = tuple(path.resolve() for path in excluded)
-    values = []
-    for path in root.rglob("*"):
-        if not path.is_file() or any(part in EXCLUDED for part in path.relative_to(root).parts):
-            continue
-        resolved = path.resolve()
-        if any(resolved == item or item in resolved.parents for item in excluded):
-            continue
-        values.append(path)
-    return sorted(values, key=lambda path: path.relative_to(root).as_posix())
+    return sorted(
+        (path for path in root.rglob("*") if path.is_file() and not skipped(path, root, excluded)),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
 
 
 def tree_digest(root: pathlib.Path, files: list[pathlib.Path]) -> str:
@@ -50,52 +52,63 @@ def create_manifest(
     runner: pathlib.Path,
     simulator: pathlib.Path,
     agent: pathlib.Path,
-    output: pathlib.Path,
-    workers: int,
-    timeout: float,
+    output: pathlib.Path | None = None,
+    worker_count: int = 1,
 ) -> dict:
-    if workers <= 0 or timeout <= 0:
-        raise ValueError("invalid parallel execution settings")
-    files = source_files(root, (output,))
-    value = {
+    if worker_count <= 0:
+        raise ValueError("worker count must be positive")
+    excluded = (output,) if output else ()
+    files = source_files(root, excluded)
+    manifest = {
         "schema_version": 2,
         "source_tree_sha256": tree_digest(root, files),
-        "source_files": [{"path": path.relative_to(root).as_posix(), "sha256": file_digest(path)} for path in files],
+        "source_files": [
+            {"path": path.relative_to(root).as_posix(), "sha256": file_digest(path)}
+            for path in files
+        ],
         "executables": {
             "runner": executable(runner),
             "simulator": executable(simulator),
             "agent": executable(agent),
         },
-        "dispatch": {
-            "strategy": "bounded-subprocess",
-            "workers": workers,
-            "timeout_seconds": timeout,
-            "publication_order": "mission-identity",
-        },
+        "worker_count": worker_count,
     }
-    value["run_id"] = hashlib.sha256(canonical_bytes(value)).hexdigest()
-    return value
+    manifest["run_id"] = hashlib.sha256(canonical_bytes(manifest)).hexdigest()
+    return manifest
 
 
-def write_manifest(path: pathlib.Path, value: dict) -> None:
+def write_manifest(path: pathlib.Path, manifest: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.parent.mkdir(parents=True, exist_ok=True)
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+    temporary.write_bytes(json.dumps(manifest, indent=2, sort_keys=True).encode() + b"\n")
     os.replace(temporary, path)
 
 
-def verify_manifest(path: pathlib.Path, root: pathlib.Path, output: pathlib.Path) -> dict:
+def verify_manifest(path: pathlib.Path, root: pathlib.Path, output: pathlib.Path | None = None) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
+    if value.get("schema_version") != 2:
+        raise ValueError("unsupported manifest schema")
     run_id = validate_digest(value.get("run_id"))
     identity = dict(value)
     identity.pop("run_id")
-    if value.get("schema_version") != 2 or hashlib.sha256(canonical_bytes(identity)).hexdigest() != run_id:
-        raise ValueError("manifest identity mismatch")
-    files = source_files(root, (path, output))
+    if hashlib.sha256(canonical_bytes(identity)).hexdigest() != run_id:
+        raise ValueError("run manifest identity mismatch")
+    excluded = tuple(item for item in (path, output) if item is not None)
+    files = source_files(root, excluded)
     if tree_digest(root, files) != value["source_tree_sha256"]:
-        raise ValueError("source tree differs from manifest")
-    current = {item.relative_to(root).as_posix(): file_digest(item) for item in files}
+        raise ValueError("source tree differs from run manifest")
     recorded = {item["path"]: item["sha256"] for item in value["source_files"]}
+    current = {item.relative_to(root).as_posix(): file_digest(item) for item in files}
     if current != recorded:
-        raise ValueError("source inventory differs from manifest")
+        raise ValueError("source file inventory differs from run manifest")
+    for item in value["executables"].values():
+        if file_digest(pathlib.Path(item["path"])) != item["sha256"]:
+            raise ValueError("run executable changed")
+    return value
+
+
+def verify_output(path: pathlib.Path, run_id: str) -> dict:
+    value = read_output_record(path, run_id)
+    if file_digest(path) != value["rows_sha256"]:
+        raise ValueError("benchmark results changed")
     return value

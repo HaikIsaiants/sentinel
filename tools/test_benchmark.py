@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import json
 import pathlib
-import subprocess
-import sys
 import tempfile
-import threading
-import time
 import unittest
 
 
 TOOLS = pathlib.Path(__file__).resolve().parent
+import sys
+
 sys.path.insert(0, str(TOOLS))
 
 import analyze_benchmark
@@ -24,250 +22,246 @@ import run_manifest
 RUN_ID = "a" * 64
 
 
-def records():
+class FakeWorker:
+    def __init__(self):
+        self.requests = []
+        self.closed = False
+
+    def execute(self, request, timeout):
+        self.requests.append(request)
+        output = pathlib.Path(request["output"])
+        (output / "summary.json").write_text("{}", encoding="utf-8")
+        (output / "events.pb").write_bytes(b"events")
+        return {
+            "request_id": request["request_id"],
+            "ok": True,
+            "summary": {
+                "success": True,
+                "ticks": 50,
+                "completed_tasks": 10,
+                "total_tasks": 10,
+                "terminal_hash": "stable",
+            },
+            "artifacts": ["summary.json", "events.pb"],
+        }
+
+    def close(self, force=False):
+        self.closed = True
+
+
+def seed_records():
     return [
         generate_scenarios.SeedRecord("development-nominal-0000", 11, "nominal"),
         generate_scenarios.SeedRecord("development-loss-0000", 19, "loss"),
     ]
 
 
+class FrameTests(unittest.TestCase):
+    def test_decoder_accepts_fragmented_and_coalesced_frames(self):
+        first = benchmark_runtime.encode_frame({"request_id": "one"})
+        second = benchmark_runtime.encode_frame({"request_id": "two"})
+        decoder = benchmark_runtime.FrameDecoder()
+        self.assertEqual(decoder.feed(first[:2]), [])
+        self.assertEqual(decoder.feed(first[2:] + second), [{"request_id": "one"}, {"request_id": "two"}])
+        decoder.finish()
+
+    def test_decoder_rejects_truncated_frame(self):
+        decoder = benchmark_runtime.FrameDecoder()
+        decoder.feed(benchmark_runtime.encode_frame({"value": 1})[:-1])
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            decoder.finish()
+
+    def test_decoder_rejects_oversized_frame(self):
+        decoder = benchmark_runtime.FrameDecoder(maximum=2)
+        with self.assertRaisesRegex(ValueError, "size"):
+            decoder.feed(benchmark_runtime.encode_frame({"value": 1}))
+
+
+class WorkerPoolTests(unittest.TestCase):
+    def test_pool_reuses_then_recycles_workers(self):
+        created = []
+
+        def factory():
+            worker = FakeWorker()
+            created.append(worker)
+            return worker
+
+        pool = benchmark_runtime.WorkerPool(1, factory, recycle_after=2)
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            for index in range(3):
+                response = pool.execute(
+                    {
+                        "request_id": str(index),
+                        "output": str(output),
+                    },
+                    1,
+                )
+                self.assertTrue(response["ok"])
+        self.assertEqual(len(created), 2)
+        self.assertTrue(created[0].closed)
+        pool.close()
+        self.assertTrue(created[1].closed)
+
+    def test_pool_replaces_failed_worker(self):
+        class Broken(FakeWorker):
+            def execute(self, request, timeout):
+                raise RuntimeError("broken")
+
+        created = [Broken(), FakeWorker()]
+        pool = benchmark_runtime.WorkerPool(1, lambda: created.pop(0))
+        with self.assertRaisesRegex(RuntimeError, "broken"):
+            pool.execute({"request_id": "x"}, 1)
+        pool.close()
+
+
 class GeneratorTests(unittest.TestCase):
-    def test_named_draws_are_stable(self):
-        draws = generate_scenarios.Draws("sentinel-scenario-v1", 11)
+    def test_model_is_deterministic_and_valid(self):
+        config = generate_scenarios.read_config(None)
+        first = generate_scenarios.build_model(seed_records()[0], config)
+        second = generate_scenarios.build_model(seed_records()[0], config)
+        self.assertEqual(first, second)
+        generate_scenarios.validate_model(first)
+
+    def test_named_draws_are_independent(self):
+        draws = generate_scenarios.Draws("test", 7)
         expected = draws.integer("tasks/4/x", [0, 100])
         for index in range(100):
             draws.integer(f"unrelated/{index}", [0, 100])
-        self.assertEqual(expected, draws.integer("tasks/4/x", [0, 100]))
+        self.assertEqual(draws.integer("tasks/4/x", [0, 100]), expected)
 
-    def test_pair_differs_only_by_policy(self):
+    def test_paired_digest_normalizes_policy(self):
         config = generate_scenarios.read_config(None)
-        record = records()[0]
-        self.assertEqual(len(generate_scenarios.paired_digest(record, config)), 64)
-        nearest = generate_scenarios.generate_scenario(record, "nearest", config)
-        cbba = generate_scenarios.generate_scenario(record, "cbba", config)
-        self.assertEqual(
-            nearest.replace("ALLOCATION_POLICY_NEAREST_CAPABLE", "POLICY"),
-            cbba.replace("ALLOCATION_POLICY_SENTINEL_CBBA", "POLICY"),
-        )
-
-
-class ParallelRuntimeTests(unittest.TestCase):
-    def executor(self, arguments, timeout):
-        scenario = pathlib.Path(arguments[arguments.index("--scenario") + 1])
-        summary = pathlib.Path(arguments[arguments.index("--summary") + 1])
-        event_log = pathlib.Path(arguments[arguments.index("--event-log") + 1])
-        if "slow" in scenario.read_text(encoding="utf-8"):
-            time.sleep(0.05)
-        summary.write_text(
-            json.dumps(
-                {
-                    "success": True,
-                    "ticks": 50,
-                    "completed_tasks": 10,
-                    "total_tasks": 10,
-                    "terminal_hash": "stable",
-                }
-            ),
-            encoding="utf-8",
-        )
-        event_log.write_bytes(b"events")
-        return subprocess.CompletedProcess(arguments, 0, "", "")
-
-    def test_dispatch_is_bounded_and_completion_order_can_vary(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            scenarios = []
-            for name, value in (("slow", "slow"), ("fast", "fast")):
-                scenario = root / f"{name}.textproto"
-                scenario.write_text(value, encoding="utf-8")
-                scenarios.append(benchmark_runtime.Attempt(name, scenario, root / "artifacts" / name))
-            dispatcher = benchmark_runtime.ParallelDispatcher(
-                2,
-                pathlib.Path("runner"),
-                pathlib.Path("sim"),
-                pathlib.Path("agent"),
-                root / "scratch",
-                2,
-                self.executor,
-            )
-            completed = dispatcher.dispatch(scenarios)
-            self.assertEqual({row["identity"] for row in completed}, {"fast", "slow"})
-            self.assertEqual(len({row["thread_id"] for row in completed}), 2)
-
-    def test_process_failure_is_a_result_not_pool_failure(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            scenario = root / "scenario.textproto"
-            scenario.write_text("mission", encoding="utf-8")
-
-            def fail(arguments, timeout):
-                return subprocess.CompletedProcess(arguments, 7, "", "boom")
-
-            dispatcher = benchmark_runtime.ParallelDispatcher(
-                1,
-                pathlib.Path("runner"),
-                pathlib.Path("sim"),
-                pathlib.Path("agent"),
-                root / "scratch",
-                2,
-                fail,
-            )
-            result = dispatcher.dispatch([benchmark_runtime.Attempt("one", scenario, root / "artifacts" / "one")])[0]
-            self.assertFalse(result["ok"])
-            self.assertIn("boom", result["error"])
-
-    def test_duplicate_attempts_are_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            scenario = root / "scenario"
-            scenario.write_text("x", encoding="utf-8")
-            dispatcher = benchmark_runtime.ParallelDispatcher(
-                1,
-                pathlib.Path("runner"),
-                pathlib.Path("sim"),
-                pathlib.Path("agent"),
-                root / "scratch",
-                1,
-                self.executor,
-            )
-            attempt = benchmark_runtime.Attempt("same", scenario, root / "target")
-            with self.assertRaisesRegex(ValueError, "duplicate"):
-                dispatcher.dispatch([attempt, attempt])
+        self.assertEqual(len(generate_scenarios.paired_digest(seed_records()[0], config)), 64)
 
 
 class RunnerTests(unittest.TestCase):
-    def executor(self, arguments, timeout):
-        summary = pathlib.Path(arguments[arguments.index("--summary") + 1])
-        event_log = pathlib.Path(arguments[arguments.index("--event-log") + 1])
-        summary.write_text(
-            json.dumps(
-                {
-                    "success": True,
-                    "ticks": 40,
-                    "completed_tasks": 10,
-                    "total_tasks": 10,
-                    "terminal_hash": "hash",
-                }
-            ),
-            encoding="utf-8",
-        )
-        event_log.write_bytes(b"log")
-        return subprocess.CompletedProcess(arguments, 0, "", "")
+    def pool(self):
+        return benchmark_runtime.WorkerPool(1, FakeWorker)
 
-    def dispatcher(self, root):
-        return benchmark_runtime.ParallelDispatcher(
-            2,
-            pathlib.Path("runner"),
-            pathlib.Path("sim"),
-            pathlib.Path("agent"),
-            root / "scratch",
-            2,
-            self.executor,
-        )
-
-    def test_publication_order_is_deterministic(self):
+    def test_persistent_run_publishes_and_resumes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             output = root / "rows.jsonl"
-            rows = run_benchmark.run_all(
-                list(reversed(records())),
-                output,
-                generate_scenarios.read_config(None),
-                RUN_ID,
-                self.dispatcher(root),
-            )
-            identities = [row["identity"] for row in rows]
-            self.assertEqual(identities, sorted(identities))
-            disk = [json.loads(line)["identity"] for line in output.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(disk, sorted(disk))
-
-    def test_resume_skips_verified_attempts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            output = root / "rows.jsonl"
-            first = run_benchmark.run_all(
-                records()[:1],
-                output,
-                generate_scenarios.read_config(None),
-                RUN_ID,
-                self.dispatcher(root),
-            )
-
-            class EmptyDispatcher:
-                def dispatch(self, attempts):
-                    self.attempts = attempts
-                    return []
-
-            empty = EmptyDispatcher()
+            config = generate_scenarios.read_config(None)
+            pool = self.pool()
+            first = run_benchmark.run_all(seed_records()[:1], output, config, RUN_ID, pool, 2)
+            self.assertEqual(len(first), 2)
+            record = benchmark_io.read_output_record(output, RUN_ID)
+            self.assertEqual(record["rows_sha256"], benchmark_io.file_digest(output))
+            pool.close()
+            second_pool = self.pool()
             second = run_benchmark.run_all(
-                records()[:1],
+                seed_records()[:1],
                 output,
-                generate_scenarios.read_config(None),
+                config,
                 RUN_ID,
-                empty,
+                second_pool,
+                2,
                 resume=True,
             )
             self.assertEqual(first, second)
-            self.assertEqual(empty.attempts, [])
+            self.assertEqual(second_pool.slots[0].worker.requests, [])
+            second_pool.close()
 
-    def test_shards_do_not_overlap(self):
-        first = run_benchmark.plan(records(), 0, 2, None)
-        second = run_benchmark.plan(records(), 1, 2, None)
-        self.assertFalse({run_benchmark.identity(*value) for value in first} & {run_benchmark.identity(*value) for value in second})
+    def test_tampered_artifact_is_not_resumed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            output = root / "rows.jsonl"
+            config = generate_scenarios.read_config(None)
+            pool = self.pool()
+            run_benchmark.run_all(seed_records()[:1], output, config, RUN_ID, pool, 2, limit=1)
+            pool.close()
+            event = next(output.with_suffix(output.suffix + ".artifacts").glob("**/events.pb"))
+            event.write_bytes(b"tampered")
+            replacement = self.pool()
+            run_benchmark.run_all(
+                seed_records()[:1],
+                output,
+                config,
+                RUN_ID,
+                replacement,
+                2,
+                limit=1,
+                resume=True,
+            )
+            self.assertEqual(len(replacement.slots[0].worker.requests), 1)
+            replacement.close()
+
+    def test_plan_shards_without_overlap(self):
+        first = run_benchmark.plan(seed_records(), 0, 2, None)
+        second = run_benchmark.plan(seed_records(), 1, 2, None)
+        self.assertFalse({value.identity for value in first} & {value.identity for value in second})
 
 
 class AnalyzerTests(unittest.TestCase):
     def rows(self):
-        result = []
+        rows = []
         for index, stratum in enumerate(("nominal", "loss")):
             for allocator, ticks in (("nearest", 60), ("cbba", 40)):
-                result.append(
+                rows.append(
                     {
                         "identity": f"seed-{index}.{allocator}",
                         "run_id": RUN_ID,
                         "seed_id": f"seed-{index}",
+                        "seed": index,
                         "stratum": stratum,
                         "allocator": allocator,
                         "success": True,
-                        "ticks": ticks,
                         "elapsed_seconds": 0.2,
+                        "ticks": ticks,
                         "artifacts": [],
-                        "attempt_processes": 1,
-                        "dispatch_thread": threading.get_ident(),
+                        "summary": {name: True for name in analyze_benchmark.INVARIANTS},
                         "error": "",
                     }
                 )
-        return result
+        return rows
 
-    def test_parallel_process_counts_are_reported(self):
-        report = analyze_benchmark.analyze(self.rows())
-        self.assertEqual(report["allocators"]["nearest"]["attempt_processes"], 2)
-        self.assertEqual(report["paired"]["candidate_wins"], 2)
+    def test_invariants_affect_effective_success(self):
+        rows = self.rows()
+        rows[0]["summary"][analyze_benchmark.INVARIANTS[0]] = False
+        report = analyze_benchmark.analyze(rows)
+        self.assertEqual(report["allocators"]["nearest"]["successes"], 1)
 
-    def test_artifact_path_escape_is_rejected(self):
+    def test_artifact_failure_is_recorded(self):
+        rows = self.rows()
+        report = analyze_benchmark.analyze(rows, [rows[0]["identity"]])
+        self.assertEqual(report["artifact_failure_ids"], [rows[0]["identity"]])
+        self.assertIn("Artifact failures: 1", analyze_benchmark.markdown(report))
+
+    def test_artifact_paths_cannot_escape_root(self):
         with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
             rows = self.rows()
+            rows[0]["artifact_root"] = root.name
             rows[0]["artifacts"] = [{"path": "../escape", "sha256": "0" * 64, "bytes": 1}]
-            self.assertEqual(analyze_benchmark.audit_artifacts(rows, pathlib.Path(directory)), [rows[0]["identity"]])
+            self.assertEqual(analyze_benchmark.audit_artifacts(rows, [root]), [rows[0]["identity"]])
 
 
 class ManifestTests(unittest.TestCase):
-    def test_manifest_records_bounded_dispatch(self):
+    def test_manifest_and_output_are_bound_to_run(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            source = root / "source"
+            source = root / "source.txt"
             runner = root / "runner"
             simulator = root / "simulator"
             agent = root / "agent"
             output = root / "rows.jsonl"
-            for path in (source, runner, simulator, agent):
+            source.write_text("source", encoding="utf-8")
+            output.write_text("{}\n", encoding="utf-8")
+            for path in (runner, simulator, agent):
                 path.write_text(path.name, encoding="utf-8")
-            manifest = run_manifest.create_manifest(root, runner, simulator, agent, output, 3, 45)
-            self.assertEqual(manifest["dispatch"]["strategy"], "bounded-subprocess")
-            self.assertEqual(manifest["dispatch"]["workers"], 3)
+            manifest = run_manifest.create_manifest(root, runner, simulator, agent, output, 2)
             target = root / "manifest.json"
             run_manifest.write_manifest(target, manifest)
             run_manifest.verify_manifest(target, root, output)
+            benchmark_io.write_output_record(
+                output,
+                manifest["run_id"],
+                benchmark_io.file_digest(output),
+                "b" * 64,
+            )
+            run_manifest.verify_output(output, manifest["run_id"])
 
 
 if __name__ == "__main__":
