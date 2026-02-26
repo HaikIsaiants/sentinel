@@ -1,114 +1,141 @@
-from __future__ import annotations
-
+import argparse
 import hashlib
 import json
-import os
 import pathlib
-import stat
 
-from benchmark_io import canonical_bytes, file_digest, read_output_record, validate_digest
-
-
-EXCLUDED = {".git", "build", "out", "vcpkg_installed", "__pycache__"}
+from benchmark_io import canonical_bytes, file_digest, output_record_path, read_output_record, validate_image_digest
 
 
-def skipped(path: pathlib.Path, root: pathlib.Path, excluded: tuple[pathlib.Path, ...] = ()) -> bool:
+SKIPPED = {
+    ".git",
+    ".pytest_cache",
+    "Testing",
+    "__pycache__",
+    "build",
+    "out",
+    "vcpkg_installed",
+}
+
+
+def skipped(path, root, excluded):
     relative = path.relative_to(root)
-    if any(part in EXCLUDED for part in relative.parts):
-        return True
-    resolved = path.resolve()
-    return any(resolved == item.resolve() or item.resolve() in resolved.parents for item in excluded)
-
-
-def source_files(root: pathlib.Path, excluded: tuple[pathlib.Path, ...] = ()) -> list[pathlib.Path]:
-    return sorted(
-        (path for path in root.rglob("*") if path.is_file() and not skipped(path, root, excluded)),
-        key=lambda path: path.relative_to(root).as_posix(),
+    return path in excluded or any(
+        part in SKIPPED or part.startswith(("build-", "cmake-build-"))
+        for part in relative.parts
     )
 
 
-def tree_digest(root: pathlib.Path, files: list[pathlib.Path]) -> str:
-    value = hashlib.sha256()
-    for path in files:
-        value.update(path.relative_to(root).as_posix().encode())
-        value.update(b"\0")
-        value.update(file_digest(path).encode())
-        value.update(b"\n")
-    return value.hexdigest()
+def source_files(root, excluded=()):
+    root = root.resolve()
+    excluded = {path.resolve() for path in excluded}
+    files = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or skipped(path.resolve(), root, excluded):
+            continue
+        relative = path.relative_to(root).as_posix()
+        files.append({"path": relative, "sha256": file_digest(path), "size": path.stat().st_size})
+    return files
 
 
-def executable(path: pathlib.Path) -> dict:
+def tree_digest(files):
+    return hashlib.sha256(canonical_bytes(files)).hexdigest()
+
+
+def executable(path):
+    path = path.resolve()
     if not path.is_file():
-        raise ValueError(f"missing executable: {path}")
-    return {
-        "path": str(path.resolve()),
-        "sha256": file_digest(path),
-        "mode": stat.S_IMODE(path.stat().st_mode),
-    }
+        raise RuntimeError(f"missing executable: {path}")
+    return {"name": path.name, "sha256": file_digest(path), "size": path.stat().st_size}
 
 
-def create_manifest(
-    root: pathlib.Path,
-    runner: pathlib.Path,
-    simulator: pathlib.Path,
-    agent: pathlib.Path,
-    output: pathlib.Path | None = None,
-    worker_count: int = 1,
-) -> dict:
-    if worker_count <= 0:
-        raise ValueError("worker count must be positive")
-    excluded = (output,) if output else ()
+def create_manifest(root, simulator, agent, output=None, container_image_digest="", supervisor=None):
+    root = root.resolve()
+    excluded = [output.resolve()] if output else []
+    # Skip transient build and run output when hashing the tree.
     files = source_files(root, excluded)
-    manifest = {
-        "schema_version": 2,
-        "source_tree_sha256": tree_digest(root, files),
-        "source_files": [
-            {"path": path.relative_to(root).as_posix(), "sha256": file_digest(path)}
-            for path in files
-        ],
+    benchmark_path = root / "config" / "benchmark.json"
+    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    inputs = {
+        item["path"]: item["sha256"]
+        for item in files
+        if item["path"].startswith(("benchmarks/seeds/", "config/", "scenarios/"))
+        or item["path"] in {"tools/generate_scenarios.py", "tools/generate_seeds.py"}
+    }
+    payload = {
+        "benchmark_id": benchmark["benchmark_id"],
+        "benchmark_inputs": inputs,
+        "container_image_digest": validate_image_digest(container_image_digest) if container_image_digest else "",
+        "benchmark_version": benchmark["version"],
         "executables": {
-            "runner": executable(runner),
-            "simulator": executable(simulator),
             "agent": executable(agent),
+            "simulator": executable(simulator),
         },
-        "worker_count": worker_count,
+        "schema_version": 1,
+        "source_files": files,
+        "source_digest": tree_digest(files),
     }
-    manifest["run_id"] = hashlib.sha256(canonical_bytes(manifest)).hexdigest()
-    return manifest
+    if supervisor:
+        payload["executables"]["supervisor"] = executable(supervisor)
+    return {**payload, "run_id": hashlib.sha256(canonical_bytes(payload)).hexdigest()}
 
 
-def write_manifest(path: pathlib.Path, manifest: dict) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.parent.mkdir(parents=True, exist_ok=True)
-    temporary.write_bytes(json.dumps(manifest, indent=2, sort_keys=True).encode() + b"\n")
-    os.replace(temporary, path)
+def write_manifest(path, manifest):
+    if path.exists():
+        raise RuntimeError(f"benchmark manifest already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def verify_manifest(path: pathlib.Path, root: pathlib.Path, output: pathlib.Path | None = None) -> dict:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("schema_version") != 2:
-        raise ValueError("unsupported manifest schema")
-    run_id = validate_digest(value.get("run_id"))
-    identity = dict(value)
-    identity.pop("run_id")
-    if hashlib.sha256(canonical_bytes(identity)).hexdigest() != run_id:
-        raise ValueError("run manifest identity mismatch")
-    excluded = tuple(item for item in (path, output) if item is not None)
-    files = source_files(root, excluded)
-    if tree_digest(root, files) != value["source_tree_sha256"]:
-        raise ValueError("source tree differs from run manifest")
-    recorded = {item["path"]: item["sha256"] for item in value["source_files"]}
-    current = {item.relative_to(root).as_posix(): file_digest(item) for item in files}
-    if current != recorded:
-        raise ValueError("source file inventory differs from run manifest")
-    for item in value["executables"].values():
-        if file_digest(pathlib.Path(item["path"])) != item["sha256"]:
-            raise ValueError("run executable changed")
-    return value
+def verify_manifest(path, root, simulator, agent, container_image_digest="", supervisor=None):
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    if container_image_digest and stored.get("container_image_digest") != validate_image_digest(container_image_digest):
+        raise RuntimeError("benchmark manifest container image digest does not match")
+    current = create_manifest(root, simulator, agent, path, stored.get("container_image_digest", ""), supervisor)
+    if stored != current:
+        raise RuntimeError("benchmark manifest does not match the source tree and executables")
+    return stored
 
 
-def verify_output(path: pathlib.Path, run_id: str) -> dict:
-    value = read_output_record(path, run_id)
-    if file_digest(path) != value["rows_sha256"]:
-        raise ValueError("benchmark results changed")
-    return value
+def record_output(path, manifest, output):
+    record = output_record_path(path, manifest["run_id"])
+    record_data = {
+        "container_image_digest": manifest["container_image_digest"],
+        "output": str(output.resolve()),
+        "run_id": manifest["run_id"],
+        "schema_version": 1,
+    }
+    try:
+        with record.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record_data, indent=2, sort_keys=True) + "\n")
+    except FileExistsError:
+        raise RuntimeError("benchmark manifest already has an output")
+    return record
+
+
+def verify_output(path, run_id, container_image_digest):
+    return read_output_record(path, run_id, container_image_digest)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[1])
+    parser.add_argument("--sim", type=pathlib.Path, required=True)
+    parser.add_argument("--agent", type=pathlib.Path, required=True)
+    parser.add_argument("--supervisor", type=pathlib.Path, required=True)
+    parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--container-image-digest", required=True)
+    options = parser.parse_args()
+    manifest = create_manifest(
+        options.root,
+        options.sim,
+        options.agent,
+        options.output,
+        options.container_image_digest,
+        options.supervisor,
+    )
+    write_manifest(options.output, manifest)
+    print(json.dumps({"run_id": manifest["run_id"], "source_digest": manifest["source_digest"]}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
