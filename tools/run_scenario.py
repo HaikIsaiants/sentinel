@@ -3,7 +3,10 @@ import json
 import pathlib
 import struct
 import subprocess
+import sys
 import threading
+
+from sentinel.v1 import sentinel_pb2
 
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -51,54 +54,38 @@ def read_message(stream, message_type):
     return result[0]
 
 
-def stop_process(process, wait_seconds=5):
+def stop_process(process):
     if process.stdin and not process.stdin.closed:
         process.stdin.close()
     try:
-        return_code = process.wait(timeout=wait_seconds)
+        return_code = process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.terminate()
         try:
-            return_code = process.wait(timeout=wait_seconds)
+            return_code = process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
-            return_code = process.wait(timeout=wait_seconds)
-    error = process.stderr.read() if process.stderr else b""
-    if isinstance(error, bytes):
-        error = error.decode("utf-8", errors="replace")
-    for stream in (process.stdout, process.stderr):
-        if stream and not stream.closed:
-            stream.close()
+            return_code = process.wait(timeout=5)
+    error = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
     if return_code != 0:
         return error.strip() or f"process exited with {return_code}"
     return ""
 
 
-def run_once(simulator, agent, scenario, output, run_index):
-    from sentinel.v1 import sentinel_pb2
-
-    log_path = output / f"run-{run_index}.events.pb"
-    summary_path = output / f"run-{run_index}.json"
-    replay_path = output / f"replay-{run_index}.json"
+def run_once(simulator, agent, scenario, output, run_idx):
+    log_path = output / f"run-{run_idx}.events.pb"
+    summary_path = output / f"run-{run_idx}.json"
+    replay_path = output / f"replay-{run_idx}.json"
     simulation = subprocess.Popen(
-        [
-            str(simulator),
-            "run",
-            "--scenario",
-            str(scenario),
-            "--log",
-            str(log_path),
-            "--summary",
-            str(summary_path),
-        ],
+        [str(simulator), "run", "--scenario", str(scenario), "--log", str(log_path), "--summary", str(summary_path)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     agents = {}
     summary = None
-    run_error = None
     cleanup_errors = []
+    run_error = None
     current_tick = 0
     try:
         while True:
@@ -111,14 +98,15 @@ def run_once(simulator, agent, scenario, output, run_index):
                 summary = sentinel_pb2.SimulationSummary()
                 summary.CopyFrom(observations.summary)
                 break
-            batch = sentinel_pb2.ActionBatch(tick=current_tick)
-            for envelope in sorted(
-                observations.observations,
-                key=lambda value: value.recipient_id,
-            ):
+            if not 3 <= len(observations.observations) <= 5:
+                raise RuntimeError("mission does not contain three to five agents")
+            batch = sentinel_pb2.ActionBatch(tick=observations.tick)
+            for envelope in sorted(observations.observations, key=lambda value: value.recipient_id):
                 agent_id = envelope.recipient_id
                 if envelope.observation.self.id != agent_id:
                     raise RuntimeError("observation crossed an agent boundary")
+                if any(task.assigned_agent_id != agent_id for task in envelope.observation.assigned_tasks):
+                    raise RuntimeError("agent received another agent's task")
                 if agent_id not in agents:
                     agents[agent_id] = subprocess.Popen(
                         [str(agent), "--id", agent_id],
@@ -147,30 +135,17 @@ def run_once(simulator, agent, scenario, output, run_index):
     if cleanup_errors:
         raise RuntimeError("; ".join(cleanup_errors))
     if summary is None or not summary.success:
-        raise RuntimeError("mission did not complete")
-    process_ids = {simulation.pid, *(process.pid for process in agents.values())}
-    if len(process_ids) != len(agents) + 1:
+        raise RuntimeError("scripted mission did not complete")
+    if len({simulation.pid, *(process.pid for process in agents.values())}) != len(agents) + 1:
         raise RuntimeError("agent processes were not isolated")
     replay = subprocess.run(
-        [
-            str(simulator),
-            "replay",
-            "--scenario",
-            str(scenario),
-            "--log",
-            str(log_path),
-            "--summary",
-            str(replay_path),
-        ],
+        [str(simulator), "replay", "--scenario", str(scenario), "--log", str(log_path), "--summary", str(replay_path)],
         check=True,
         capture_output=True,
         text=True,
     )
     replay_summary = json.loads(replay_path.read_text(encoding="utf-8"))
-    if (
-        replay.stdout.strip() != summary.terminal_hash
-        or replay_summary["terminal_hash"] != summary.terminal_hash
-    ):
+    if replay.stdout.strip() != summary.terminal_hash or replay_summary["terminal_hash"] != summary.terminal_hash:
         raise RuntimeError("event log replay changed the terminal hash")
     return summary, log_path, len(agents)
 
@@ -182,21 +157,23 @@ def main():
     parser.add_argument("--scenario", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--require-positive", action="append", default=[])
+    parser.add_argument("--require-complete-reassignments", action="store_true")
     args = parser.parse_args()
     if args.repeat < 2:
         raise RuntimeError("repeat must be at least two")
     args.output.mkdir(parents=True, exist_ok=True)
-    results = [
-        run_once(args.sim, args.agent, args.scenario, args.output, run_index)
-        for run_index in range(args.repeat)
-    ]
+    results = [run_once(args.sim, args.agent, args.scenario, args.output, run_idx)
+               for run_idx in range(args.repeat)]
+    for field in args.require_positive:
+        if field not in results[0][0].DESCRIPTOR.fields_by_name or getattr(results[0][0], field) <= 0:
+            raise RuntimeError(f"required positive summary field is missing: {field}")
+    if args.require_complete_reassignments and results[0][0].missing_reassignments:
+        raise RuntimeError("reassignment did not complete")
     expected_hashes = list(results[0][0].tick_hashes)
     expected_log = results[0][1].read_bytes()
     for summary, log_path, agent_count in results[1:]:
-        if (
-            summary.terminal_hash != results[0][0].terminal_hash
-            or list(summary.tick_hashes) != expected_hashes
-        ):
+        if summary.terminal_hash != results[0][0].terminal_hash or list(summary.tick_hashes) != expected_hashes:
             raise RuntimeError("repeated simulation changed state hashes")
         if log_path.read_bytes() != expected_log:
             raise RuntimeError("repeated simulation changed event log bytes")
@@ -208,11 +185,65 @@ def main():
         "repeat_count": args.repeat,
         "terminal_hash": results[0][0].terminal_hash,
         "tick_count": results[0][0].ticks,
+        "wait_ticks": results[0][0].wait_ticks,
+        "replan_count": results[0][0].replan_count,
+        "recharge_ticks": results[0][0].recharge_ticks,
+        "return_ticks": results[0][0].return_ticks,
+        "route_conflicts": results[0][0].route_conflicts,
+        "travel_distance_mm": results[0][0].travel_distance_mm,
+        "energy_consumed_mj": results[0][0].energy_consumed_mj,
+        "communication_bytes": results[0][0].communication_bytes,
+        "communication_messages": results[0][0].communication_messages,
+        "delivered_messages": results[0][0].delivered_messages,
+        "dropped_messages": results[0][0].dropped_messages,
+        "reordered_messages": results[0][0].reordered_messages,
+        "maximum_reassignment_delay_ms": results[0][0].maximum_reassignment_delay_ms,
+        "missing_reassignments": results[0][0].missing_reassignments,
+        "allocation_convergence": [
+            {
+                "epoch": sample.epoch,
+                "start_tick": sample.start_tick,
+                "end_tick": sample.end_tick,
+                "complete": sample.complete,
+            }
+            for sample in results[0][0].allocation_convergence
+        ],
+        "failure_detections": [
+            {
+                "failed_agent_id": sample.failed_agent_id,
+                "detector_agent_id": sample.detector_agent_id,
+                "failure_tick": sample.failure_tick,
+                "detection_tick": sample.detection_tick,
+            }
+            for sample in results[0][0].failure_detections
+        ],
+        "task_reassignments": [
+            {
+                "task_id": sample.task_id,
+                "failed_agent_id": sample.failed_agent_id,
+                "detector_agent_id": sample.detector_agent_id,
+                "detection_tick": sample.detection_tick,
+                "commit_tick": sample.commit_tick,
+                "new_agent_id": sample.new_agent_id,
+                "new_epoch": sample.new_epoch,
+                "new_version": sample.new_version,
+                "complete": sample.complete,
+            }
+            for sample in results[0][0].task_reassignments
+        ],
+        "replanning_samples": [
+            {
+                "agent_id": sample.agent_id,
+                "reason": sample.reason,
+                "start_tick": sample.start_tick,
+                "end_tick": sample.end_tick,
+                "wait_plan": sample.wait_plan,
+                "complete": sample.complete,
+            }
+            for sample in results[0][0].replanning_samples
+        ],
     }
-    (args.output / "verification.json").write_text(
-        json.dumps(verification, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    (args.output / "verification.json").write_text(json.dumps(verification, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(verification, sort_keys=True))
 
 
