@@ -59,6 +59,14 @@ There are smaller scenarios for charging, rerouting, reservations, allocation un
 | `tools/` | Scenario generation, orchestration, benchmark runs, and analysis |
 | `ros2/sentinel_gazebo/` | Offline playback in Gazebo Harmonic |
 
+## Benchmark result
+
+The recorded comparison used 10,000 paired seeds, so 20,000 allocator runs in total. Fleets started with three to five mixed UAVs and UGVs. Sentinel completed 9,998 of 10,000 missions (99.980%); across the six degraded-communication groups, 5,999 of 6,000 completed and the one-sided Wilson lower bound was 99.925%.
+
+Mean makespan was 158.173 seconds for Sentinel and 229.161 seconds for nearest-capable allocation, a 30.978% reduction. All 1,500 orphaned tasks were reassigned after local failure detection, with a 0.197-second mean, 0.5-second p95, and 0.7-second maximum.
+
+The full setup, timeout notes, and limitations are in [Benchmarking](docs/benchmarking.md). The saved summary is [benchmark-result.json](docs/benchmark-result.json).
+
 ## Gazebo playback
 
 Gazebo is a viewer for an exported run. First make a presentation trace from a replayed event log:
