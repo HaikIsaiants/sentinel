@@ -1,8 +1,8 @@
 # Sentinel
 
-Sentinel is my deterministic mission simulator for small teams of UAVs and UGVs. Each vehicle gets its own process and has to coordinate search, inspection, relay, and delivery tasks while links fail, routes close, and vehicles drop out.
+Sentinel is a deterministic mission simulator for small teams of UAVs and UGVs. Each vehicle runs in its own process and coordinates search, inspection, relay, and delivery tasks while links fail, routes close, and vehicles drop out.
 
-I keep mission truth in a fixed-step simulator and give each agent only its local observations and delivered peer messages. The agents use decentralized CBBA allocation, BehaviorTree.CPP for execution, capability-aware A* routing, and time-window reservations at shared chokepoints. Runs produce event logs that can be replayed byte for byte. [Architecture](docs/architecture.md) has the longer version.
+A fixed-step simulator maintains authoritative mission state, while each agent receives only local observations and delivered peer messages. Agents use decentralized CBBA allocation, BehaviorTree.CPP for execution, capability-aware A* routing, and time-window reservations at shared chokepoints. Runs produce event logs that can be replayed byte for byte. See [Architecture](docs/architecture.md) for a detailed description.
 
 ## Build
 
